@@ -3,3 +3,12 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 *.pyc
+
+# IPM/CSV data files can contain company or card data - never commit them
+*.ipm
+*.IPM
+*.csv
+*.CSV
+*.bin
+samples/
+data/
