@@ -85,7 +85,7 @@ def cli_parser():
     parser = argparse.ArgumentParser(prog='mci_ipm_to_csv', description='Mastercard IPM to CSV')
     parser.add_argument('in_filename')
     parser.add_argument('-o', '--out-filename')
-    parser.add_argument('--in-encoding')
+    parser.add_argument('--in-encoding', default='cp037', help='IPM file encoding (default cp037)')
     parser.add_argument('--out-encoding')
     parser.add_argument('--no1014blocking', action='store_true')
     parser.add_argument('--config-file', help='File containing cardkit configuration - JSON format')
@@ -95,14 +95,14 @@ def cli_parser():
     return parser
 
 
-def mci_ipm_to_csv(in_ipm, out_csv, config, in_encoding=None, no1014blocking=False, **_):
+def mci_ipm_to_csv(in_ipm, out_csv, config, in_encoding='cp037', no1014blocking=False, **_):
     """
     Create a csv file given an input Mastercard IPM file
 
     :param in_ipm: binary input IPM file object
     :param out_csv: output csv file object
     :param config: dict containing cardkit config
-    :param in_encoding: input file encoding string (default latin-1)
+    :param in_encoding: input file encoding string (default cp037)
     :param no1014blocking: set True if no 1014 blocking used
     :return: None
     """

@@ -30,7 +30,8 @@ def cli_parser():
     def common(sub):
         sub.add_argument('in_filename')
         sub.add_argument('-o', '--out-filename')
-        sub.add_argument('--encoding', help='file encoding (default: detected, or from CSV META row)')
+        sub.add_argument('--encoding', help='IPM file encoding (default: cp037; csv2ipm uses the CSV META row '
+                                            'when there is one)')
         blocked = sub.add_mutually_exclusive_group()
         blocked.add_argument('--blocked', dest='blocked', action='store_true', default=None,
                              help='1014 blocked IPM file')

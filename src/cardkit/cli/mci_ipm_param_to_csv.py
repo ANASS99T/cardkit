@@ -34,7 +34,7 @@ def cli_parser():
     parser.add_argument("in_filename", help="IPM Parameter file to process")
     parser.add_argument("table_id", help="Parameter table to extract")
     parser.add_argument("-o", "--out-filename")
-    parser.add_argument("--in-encoding")
+    parser.add_argument("--in-encoding", default="cp037", help="IPM file encoding (default cp037)")
     parser.add_argument("--out-encoding")
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--no1014blocking", action="store_true")
@@ -52,7 +52,7 @@ def mci_ipm_param_to_csv(
     out_csv,
     table_id,
     config=None,
-    in_encoding=None,
+    in_encoding="cp037",
     no1014blocking=False,
     expanded=False,
     **_

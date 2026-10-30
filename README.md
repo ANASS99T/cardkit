@@ -24,7 +24,9 @@ cardkit csv2ipm T112.csv -o T112_rebuilt.ipm
 cardkit compare T112.ipm T112_rebuilt.ipm
 ```
 
-`ipm2csv` detects the encoding (ASCII/latin_1 or EBCDIC cp500) and 1014 blocking itself, then **verifies** that the CSV rebuilds the identical file. If it doesn't, it fails instead of handing you a lossy CSV. Use `--encoding`, `--blocked`/`--unblocked` or `--config-file` to override.
+The encoding is **always EBCDIC cp037** unless you pass `--encoding` (for example `--encoding latin_1` for an ASCII file). `ipm2csv` warns if the first MTI looks like ASCII. 1014 blocking is detected automatically; use `--blocked`/`--unblocked` to override it, or `--config-file` for a custom field config.
+
+`ipm2csv` then **verifies** that the CSV rebuilds the identical file. If it doesn't, it fails instead of handing you a lossy CSV.
 
 ### What's in the CSV
 
@@ -55,7 +57,7 @@ When the CSV has no file header (MTI 1644, DE24 `697`) or no trailer (MTI 1644, 
 
 The File ID is copied from the existing header or trailer if there is one. Otherwise it is built from `--file-type`, `--file-date` (YYMMDD, default today), `--processor-id` and `--file-seq`. A CSV made from an IPM file that had no header or trailer remembers that, so `csv2ipm` doesn't add one. `--no-header-trailer` turns generation off.
 
-A hand-made CSV only needs `MTI` and `DEn` columns. It is treated as latin_1, not blocked, unless you pass `--encoding` / `--blocked`.
+A hand-made CSV only needs `MTI` and `DEn` columns. It is written as cp037, not blocked, unless you pass `--encoding` / `--blocked`. A CSV made by `ipm2csv` remembers its encoding in the META row, and `--encoding` overrides that too.
 
 ## Python API
 
@@ -72,7 +74,7 @@ data = ipmcsv.write_ipm(ipm)
 
 ## cardutil compatibility
 
-`cardkit.iso8583`, `cardkit.mciipm`, `cardkit.card`, `cardkit.pinblock`, `cardkit.key` and `cardkit.config` have the same API as cardutil 0.7.3. Change `cardutil` to `cardkit` in your imports. The cardutil test suite passes against cardkit. Fixes (details in [ANALYSIS.md](ANALYSIS.md)):
+`cardkit.iso8583`, `cardkit.mciipm`, `cardkit.card`, `cardkit.pinblock`, `cardkit.key` and `cardkit.config` have the same API as cardutil 0.7.3. Change `cardutil` to `cardkit` in your imports. The library functions (`loads`, `dumps`, `IpmReader`, `IpmWriter`) keep cardutil's latin_1 default so existing code behaves the same. The commands that read or write IPM files (`mci_ipm_to_csv`, `mci_csv_to_ipm`, `mci_ipm_param_to_csv`) default to cp037. The cardutil test suite passes against cardkit. Fixes (details in [ANALYSIS.md](ANALYSIS.md)):
 
 - messages with only a primary bitmap can be read; DE128 is processed
 - values too long for a field raise an error instead of being cut off or corrupting the length prefix

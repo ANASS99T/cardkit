@@ -52,6 +52,7 @@ from cardkit.config import config as default_config
 
 LOGGER = logging.getLogger(__name__)
 
+DEFAULT_ENCODING = 'cp037'  # used unless an encoding is given
 HEX_PREFIX = 'hex:'
 BLOCK_DATA_SIZE = 1012
 BLOCK_SIZE = 1014
@@ -126,7 +127,7 @@ class IpmFile:
     In memory image of an IPM file holding everything needed to rebuild it exactly.
     """
     records: typing.List[IpmRecord] = field(default_factory=list)
-    encoding: str = 'latin_1'
+    encoding: str = DEFAULT_ENCODING
     blocked: bool = False
     terminator: bool = True                    # zero length record at end of VBS data
     tail: bytes = b''                          # bytes after the terminator (incl. 1014 fill)
@@ -260,16 +261,12 @@ def is_1014_blocked(data: bytes) -> bool:
     return _vbs_ends_cleanly(unblock(data)[0]) and not _vbs_ends_cleanly(data)
 
 
-def detect_encoding(vbs_data: bytes) -> str:
+def looks_ascii(vbs_data: bytes) -> bool:
     """
-    Guess encoding from first record MTI: ASCII digits -> latin_1, EBCDIC digits -> cp500.
+    True if the first record MTI is ASCII digits (an ASCII file rather than EBCDIC).
     """
     mti = vbs_data[4:8]
-    if all(0x30 <= b <= 0x39 for b in mti):
-        return 'latin_1'
-    if mti and all(0xF0 <= b <= 0xF9 for b in mti):
-        return 'cp500'
-    return 'latin_1'
+    return len(mti) == 4 and all(0x30 <= b <= 0x39 for b in mti)
 
 
 def unblock(data: bytes) -> typing.Tuple[bytes, bytes, typing.Dict[int, bytes]]:
@@ -316,7 +313,7 @@ def read_ipm(data: bytes, encoding: str = None, blocked: bool = None,
     parsed are kept raw and unreadable data at the end is kept as ``tail``.
 
     :param data: the IPM file contents
-    :param encoding: text encoding, detected from first MTI when not given
+    :param encoding: text encoding, default cp037
     :param blocked: 1014 blocked file, detected when not given
     :param bit_config: cardutil style bit config
     """
@@ -328,7 +325,10 @@ def read_ipm(data: bytes, encoding: str = None, blocked: bool = None,
     if blocked:
         vbs_data, block_trailer, trailers = unblock(data)
     if encoding is None:
-        encoding = detect_encoding(vbs_data)
+        encoding = DEFAULT_ENCODING
+        if looks_ascii(vbs_data):
+            LOGGER.warning('first MTI looks like ASCII but encoding %s is used - '
+                           'give the encoding (e.g. latin_1) if this is an ASCII file', encoding)
 
     ipm = IpmFile(encoding=encoding, blocked=blocked, block_trailer=block_trailer, block_trailers=trailers,
                   terminator=False)
@@ -535,7 +535,7 @@ def _meta_from_string(meta: str) -> dict:
         index, trailer = item.split(':', 1)
         trailers[int(index)] = bytes.fromhex(trailer)
     return {
-        'encoding': values.get('encoding', 'latin_1'),
+        'encoding': values.get('encoding', DEFAULT_ENCODING),
         'blocked': values.get('blocked') == '1',
         'terminator': values.get('terminator', '1') == '1',
         'had_header': values.get('header', '1') == '1',
@@ -573,7 +573,7 @@ def read_csv(in_csv: typing.TextIO, bit_config: dict = None, encoding: str = Non
     """
     Read a CSV text stream into an :class:`IpmFile`.
 
-    File details come from the META row. Without a META row (hand made CSV) defaults are latin_1,
+    File details come from the META row. Without a META row (hand made CSV) defaults are cp037,
     not blocked, with end of file marker. ``encoding`` and ``blocked`` override either.
     """
     specs = get_field_specs(bit_config)

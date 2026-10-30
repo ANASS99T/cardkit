@@ -53,19 +53,40 @@ def roundtrip(data, **kwargs):
     return csv_text_to_ipm_bytes(text), text
 
 
-@pytest.mark.parametrize('encoding', ['latin_1', 'cp500'])
+@pytest.mark.parametrize('encoding', ['cp037', 'latin_1', 'cp500'])
 @pytest.mark.parametrize('blocked', [False, True])
 def test_roundtrip_identical(encoding, blocked):
     data = vbs(sample_records(encoding), blocked=blocked)
-    rebuilt, text = roundtrip(data)
+    rebuilt, text = roundtrip(data, encoding=encoding)
     assert rebuilt == data
-    ipm = read_ipm(data)
+    ipm = read_ipm(data, encoding=encoding)
     assert (ipm.encoding, ipm.blocked) == (encoding, blocked)
     assert all(r.raw is None for r in ipm.records)
 
 
+def test_default_encoding_is_cp037(caplog):
+    for encoding in ('cp037', 'cp500', 'latin_1'):
+        data = vbs(sample_records(encoding))
+        assert read_ipm(data).encoding == 'cp037'
+        assert roundtrip(data)[0] == data  # still lossless whatever the real encoding
+    assert 'looks like ASCII' in caplog.text
+    hand_made = read_csv(io.StringIO('MTI,DE24\n1240,200\n', newline=''))
+    assert hand_made.encoding == 'cp037'
+    assert read_csv(io.StringIO('MTI,DE24\n1240,200\n', newline=''), encoding='latin_1').encoding == 'latin_1'
+
+
+def test_encoding_option_overrides_default(tmp_path):
+    data = vbs(sample_records('latin_1'))
+    (tmp_path / 'a.ipm').write_bytes(data)
+    result = convert_ipm_to_csv(str(tmp_path / 'a.ipm'), str(tmp_path / 'a.csv'), encoding='latin_1')
+    assert result.encoding == 'latin_1' and result.raw_records == 0
+    assert 'encoding=latin_1' in (tmp_path / 'a.csv').read_text()
+    assert cardkit_cli.cli_run(['ipm2csv', str(tmp_path / 'a.ipm'), '-o', str(tmp_path / 'b.csv')]) == 0
+    assert 'encoding=cp037' in (tmp_path / 'b.csv').read_text()
+
+
 def test_csv_shows_values_untouched():
-    data = vbs(sample_records('cp500'))
+    data = vbs(sample_records('cp037'))
     _, text = roundtrip(data)
     assert '"000000012550"' in text                     # leading zeros kept
     assert '"  1  0  1  1"' in text                     # spaces kept
@@ -76,13 +97,13 @@ def test_csv_shows_values_untouched():
 
 
 def test_present_empty_llvar_kept():
-    data = vbs(sample_records('latin_1'))
+    data = vbs(sample_records('cp037'))
     ipm = read_csv(io.StringIO(ipm_bytes_to_csv_text(data), newline=''))
     assert ipm.records[1].fields[95] == b''
 
 
 def test_unknown_field_kept_raw():
-    record = rec('latin_1', '1240', DE2='5555444433332222') + b'X'  # trailing junk -> unparseable
+    record = rec('cp037', '1240', DE2='5555444433332222') + b'X'  # trailing junk -> unparseable
     odd = b'1240' + make_bitmap([7]) + b'0101120000'                   # DE7 not in config
     data = vbs([record, odd])
     rebuilt, text = roundtrip(data)
@@ -99,7 +120,7 @@ def test_control_chars_and_hex_prefix_escaped():
 
 
 def test_no_terminator_and_trailing_garbage():
-    records = sample_records('latin_1')
+    records = sample_records('cp037')
     for data in (vbs(records, terminator=False),
                  vbs(records) + b'\x00\x01trailing junk',
                  vbs(records)[:-3],                       # truncated terminator
@@ -109,8 +130,8 @@ def test_no_terminator_and_trailing_garbage():
 
 
 def test_primary_only_and_empty_secondary_bitmaps():
-    data = vbs([rec('latin_1', '0100', secondary=False, DE2='4444555566667777', DE3='000000'),
-                rec('latin_1', '1240', secondary=True, DE2='4444555566667777')])
+    data = vbs([rec('cp037', '0100', secondary=False, DE2='4444555566667777', DE3='000000'),
+                rec('cp037', '1240', secondary=True, DE2='4444555566667777')])
     rebuilt, text = roundtrip(data)
     assert rebuilt == data
     ipm = read_ipm(data)
@@ -118,7 +139,7 @@ def test_primary_only_and_empty_secondary_bitmaps():
 
 
 def test_blocked_edge_cases():
-    records = sample_records('latin_1')
+    records = sample_records('cp037')
     data = vbs(records, blocked=True)
     # non standard block trailer and a truncated final block
     odd = data[:1012] + b'\x00\x01' + data[1014:]
@@ -126,7 +147,7 @@ def test_blocked_edge_cases():
         rebuilt, _ = roundtrip(sample, blocked=True)
         assert rebuilt == sample
     # data ending exactly on a block boundary (cardutil adds a whole block of fill)
-    filler = rec('latin_1', '1240', DE127='x' * 981)  # 4 + (4+16+3+981) + 4 = 1012
+    filler = rec('cp037', '1240', DE127='x' * 981)  # 4 + (4+16+3+981) + 4 = 1012
     exact = vbs([filler], blocked=True)
     assert roundtrip(exact)[0] == exact
 
@@ -139,7 +160,7 @@ def test_random_fuzz_roundtrip():
             if rnd.random() < 0.5:
                 records.append(bytes(rnd.getrandbits(8) for _ in range(rnd.randint(1, 300))))
             else:
-                records.append(rec('latin_1', '1240', DE2='4' * rnd.randint(0, 19),
+                records.append(rec('cp037', '1240', DE2='4' * rnd.randint(0, 19),
                                    DE48=''.join(chr(rnd.randint(0, 255)) for _ in range(rnd.randint(0, 50))),
                                    DE55=bytes(rnd.getrandbits(8) for _ in range(rnd.randint(0, 255)))))
         data = vbs(records, blocked=rnd.random() < 0.5, terminator=rnd.random() < 0.8)
@@ -149,24 +170,24 @@ def test_random_fuzz_roundtrip():
 
 
 def test_edited_csv_builds_valid_file():
-    data = vbs(sample_records('cp500'), blocked=True)
+    data = vbs(sample_records('cp037'), blocked=True)
     text = ipm_bytes_to_csv_text(data)
     text = text.replace('"MERCHANT0000001"', '"MERCHANT0000002"').replace('"free text 0000 "', '"much longer text ' + 'y' * 900 + '"')
     out = csv_text_to_ipm_bytes(text)
     assert len(out) % 1014 == 0
-    records = list(mciipm.IpmReader(io.BytesIO(out), encoding='cp500', blocked=True))
+    records = list(mciipm.IpmReader(io.BytesIO(out), encoding='cp037', blocked=True))
     assert records[1]['DE42'] == 'MERCHANT0000002'
     assert records[1]['DE127'].startswith('much longer text')
 
 
 def test_edited_fixed_field_wrong_length_rejected():
-    text = ipm_bytes_to_csv_text(vbs(sample_records('latin_1'))).replace('"MERCHANT0000001"', '"SHORT"')
+    text = ipm_bytes_to_csv_text(vbs(sample_records('cp037'))).replace('"MERCHANT0000001"', '"SHORT"')
     with pytest.raises(IpmCsvError, match='DE42'):
         csv_text_to_ipm_bytes(text)
 
 
 def test_file_conversion_verified(tmp_path):
-    data = vbs(sample_records('cp500'), blocked=True)
+    data = vbs(sample_records('cp037'), blocked=True)
     ipm_in, csv_out, ipm_out = tmp_path / 'in.ipm', tmp_path / 'out.csv', tmp_path / 'out.ipm'
     ipm_in.write_bytes(data)
     result = convert_ipm_to_csv(str(ipm_in), str(csv_out))
@@ -188,7 +209,7 @@ def test_header_trailer_generated_for_hand_made_csv(tmp_path):
     csv_in.write_text(HAND_MADE)
     result = convert_csv_to_ipm(str(csv_in), str(ipm_out), file_id=FileId('002', '261030', '00000012345', '00007'))
     assert len(result.messages) == 2
-    records = list(mciipm.IpmReader(io.BytesIO(ipm_out.read_bytes())))
+    records = list(mciipm.IpmReader(io.BytesIO(ipm_out.read_bytes()), encoding='cp037'))
     assert [(r['MTI'], r.get('DE24')) for r in records] == [
         ('1644', '697'), ('1240', '200'), ('1240', '200'), ('1644', '695')]
     assert records[0]['PDS0105'] == '002261030000000123450000' + '7'
@@ -200,24 +221,24 @@ def test_header_trailer_generated_for_hand_made_csv(tmp_path):
 
 
 def test_only_missing_trailer_generated_using_header_file_id(tmp_path):
-    records = sample_records('latin_1')[:-1]
+    records = sample_records('cp037')[:-1]
     ipm = read_ipm(vbs(records))
     ipm.had_trailer = True
     added = add_header_trailer(ipm)
     assert len(added) == 1 and 'trailer' in added[0]
-    trailer = ipm.records[-1].fields[48].decode()
+    trailer = ipm.records[-1].fields[48].decode('cp037')
     assert trailer.startswith('01050250012610300000001234500001')
     assert trailer.endswith('0306008' '00000004')
 
 
 def test_no_generation_when_source_had_none():
-    data = vbs(sample_records('latin_1')[1:3])  # no header / trailer in original
+    data = vbs(sample_records('cp037')[1:3])  # no header / trailer in original
     text = ipm_bytes_to_csv_text(data)
     assert 'header=0' in text and 'trailer=0' in text
 
 
 def test_no_generation_when_source_had_none_file(tmp_path):
-    data = vbs(sample_records('latin_1')[1:3])
+    data = vbs(sample_records('cp037')[1:3])
     ipm_in, csv_out, ipm_out = tmp_path / 'in.ipm', tmp_path / 'out.csv', tmp_path / 'out.ipm'
     ipm_in.write_bytes(data)
     convert_ipm_to_csv(str(ipm_in), str(csv_out))
@@ -226,7 +247,7 @@ def test_no_generation_when_source_had_none_file(tmp_path):
 
 
 def test_deleted_header_and_trailer_rows_regenerated():
-    data = vbs(sample_records('latin_1'))
+    data = vbs(sample_records('cp037'))
     lines = ipm_bytes_to_csv_text(data).splitlines(keepends=True)
     trimmed = ''.join(lines[:2] + lines[3:-1])  # drop header (row 1) and trailer (row 4)
     ipm = read_csv(io.StringIO(trimmed, newline=''))
@@ -237,7 +258,7 @@ def test_deleted_header_and_trailer_rows_regenerated():
 # --- CLI -----------------------------------------------------------------------------------
 
 def test_cli_roundtrip(tmp_path, capsys):
-    data = vbs(sample_records('cp500'), blocked=True)
+    data = vbs(sample_records('cp037'), blocked=True)
     (tmp_path / 'f.ipm').write_bytes(data)
     assert cardkit_cli.cli_run(['ipm2csv', str(tmp_path / 'f.ipm')]) == 0
     assert cardkit_cli.cli_run(['csv2ipm', str(tmp_path / 'f.ipm.csv'), '-o', str(tmp_path / 'g.ipm')]) == 0
@@ -247,7 +268,7 @@ def test_cli_roundtrip(tmp_path, capsys):
 
 def test_blocked_with_zero_block_trailers():
     """some producers end each 1014 block with x'0000' instead of x'4040'"""
-    records = sample_records('cp500')
+    records = sample_records('cp037')
     standard = vbs(records[:1] + records[1:3] * 3 + records[3:], blocked=True)
     data = b''.join(standard[i:i + 1012] + b'\x00\x00' for i in range(0, len(standard), 1014))
     ipm = read_ipm(data)
@@ -265,7 +286,7 @@ def test_header_processing_mode(tmp_path):
     csv_in, ipm_out = tmp_path / 'in.csv', tmp_path / 'out.ipm'
     csv_in.write_text(HAND_MADE)
     assert cardkit_cli.cli_run(['csv2ipm', str(csv_in), '-o', str(ipm_out), '--processing-mode', 'T']) == 0
-    header = next(iter(mciipm.IpmReader(io.BytesIO(ipm_out.read_bytes()))))
+    header = next(iter(mciipm.IpmReader(io.BytesIO(ipm_out.read_bytes()), encoding='cp037')))
     assert header['PDS0122'] == 'T'
     ipm = read_csv(io.StringIO(HAND_MADE, newline=''))
     with pytest.raises(IpmCsvError, match='PDS 0122'):
