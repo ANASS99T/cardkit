@@ -40,7 +40,7 @@ def cli_parser():
     parser.add_argument("--no1014blocking", action="store_true")
     parser.add_argument("--expanded", action="store_true")
     parser.add_argument(
-        "--config-file", help="File containing cardutil configuration - JSON format"
+        "--config-file", help="File containing cardkit configuration - JSON format"
     )
     add_version(parser)
 

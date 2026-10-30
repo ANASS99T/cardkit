@@ -1,4 +1,4 @@
-__version__ = '0.7.3'
+__version__ = '0.1.0'
 
 
 class CardutilError(Exception):
@@ -15,3 +15,6 @@ class CardutilError(Exception):
             self.binary_context_data = kwargs['binary_context_data']
         if kwargs.get('original_exception'):
             self.ex = kwargs['original_exception']
+
+
+CardkitError = CardutilError

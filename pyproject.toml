@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cardkit"
+version = "0.1.0"
+description = "Lossless Mastercard IPM tooling and payment card utilities (drop-in replacement for cardutil)"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+classifiers = [
+  "Programming Language :: Python :: 3",
+]
+
+[project.optional-dependencies]
+crypto = ["cryptography >= 44"]
+test = ["pytest", "cryptography", "python-dateutil"]
+
+[project.scripts]
+cardkit = "cardkit.cli.cardkit_cli:cli_entry"
+mci_ipm_to_csv = "cardkit.cli.mci_ipm_to_csv:cli_entry"
+mci_csv_to_ipm = "cardkit.cli.mci_csv_to_ipm:cli_entry"
+mci_ipm_encode = "cardkit.cli.mci_ipm_encode:cli_entry"
+mci_ipm_param_encode = "cardkit.cli.mci_ipm_param_encode:cli_entry"
+mci_ipm_param_to_csv = "cardkit.cli.mci_ipm_param_to_csv:cli_entry"
+mideu = "cardkit.cli.mideu:cli_entry"
+paramconv = "cardkit.cli.paramconv:cli_entry"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

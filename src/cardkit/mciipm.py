@@ -130,32 +130,25 @@ class Block1014(object):
         Write requested bytes to the output file object.
         """
         # not enough bytes to complete a block, just write and subtract from remaining
-        LOGGER.debug(f'bytes_to_write={bytes_to_write}')
         if len(bytes_to_write) < self.remaining_chars:
-            LOGGER.debug(f'len->{len(bytes_to_write)}<{self.remaining_chars}')
-            LOGGER.debug(f'write {bytes_to_write}')
             self.file_obj.write(bytes_to_write)
             self.remaining_chars -= len(bytes_to_write)
             return
 
         # complete the first record
-        LOGGER.debug(f'write first: {bytes_to_write[:self.remaining_chars]}')
         self.file_obj.write(bytes_to_write[:self.remaining_chars])
         self.file_obj.write(self.PAD_CHAR * 2)
         bytes_to_write = bytes_to_write[self.remaining_chars:]
 
         # now write complete blocks
         while len(bytes_to_write) > 1012:
-            LOGGER.debug(f'write while: {bytes_to_write[:1012]}')
             self.file_obj.write(bytes_to_write[:1012])
             self.file_obj.write(self.PAD_CHAR * 2)
             bytes_to_write = bytes_to_write[1012:]
 
         # write whatever is left
-        LOGGER.debug(f'write last: {bytes_to_write}')
         self.file_obj.write(bytes_to_write)
         self.remaining_chars = 1012-len(bytes_to_write)
-        LOGGER.debug(f'remaining_chars={self.remaining_chars}')
 
     def seek(self, pos: int) -> None:
         """
@@ -189,7 +182,7 @@ class Unblock1014(object):
     """
     def __init__(self, file_obj: typing.BinaryIO):
         self.file_obj = file_obj
-        self.buffer = b''
+        self.buffer = bytearray()
 
     def __getattr__(self, name: str) -> any:
         """
@@ -212,8 +205,12 @@ class Unblock1014(object):
             if not block:  # eof
                 break
             self.buffer += block[:1012]
-        output = self.buffer[:bytes_to_read]
-        self.buffer = self.buffer[bytes_to_read:]
+        if read_all:
+            output = bytes(self.buffer)
+            self.buffer.clear()
+            return output
+        output = bytes(self.buffer[:bytes_to_read])
+        del self.buffer[:bytes_to_read]
         return output
 
 
@@ -339,7 +336,7 @@ class IpmReader(VbsReader):
     def __next__(self) -> dict:
 
         vbs_record = super(IpmReader, self).__next__()
-        LOGGER.debug(f'{len(vbs_record)}: {vbs_record}')
+        LOGGER.debug('%s: %s', len(vbs_record), vbs_record)
         try:
             output = iso8583.loads(vbs_record, encoding=self.encoding, iso_config=self.iso_config)
         except CardutilError as ex:
@@ -775,7 +772,8 @@ def block_1014_check(sample_data):
 
 
 def bitmap_check(bitmap: bytes) -> (bool, str):
-    LOGGER.debug(hexdump.hexdump(bitmap, result='return'))
+    if LOGGER.isEnabledFor(logging.DEBUG):
+        LOGGER.debug(hexdump.hexdump(bitmap, result='return'))
     bitarray = BitArray.BitArray()
     bitarray.frombytes(bitmap)
     bits = bitarray.tolist()

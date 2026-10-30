@@ -157,7 +157,7 @@ def extract(config, **kwargs):
     """
     Create a csv file given an input Mastercard IPM file
 
-    :param config: dict containing cardutil config
+    :param config: dict containing cardkit config
     :return: None
     """
     blocked = not kwargs.get('no1014blocking', False)

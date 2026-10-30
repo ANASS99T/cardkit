@@ -28,7 +28,18 @@ def validate_check_digit(card_number: str) -> str:
     :return: None
     :raises AssertionError: Check digit is not valid
     """
-    assert calculate_check_digit(card_number[0:-1]) == card_number[-1]
+    if not is_valid_check_digit(card_number):
+        raise AssertionError(f'Invalid check digit for card number ending {card_number[-4:]}')
+
+
+def is_valid_check_digit(card_number: str) -> bool:
+    """
+    check luhn 10 check digit
+
+    :param card_number: number with check digit
+    :return: True if the check digit is valid
+    """
+    return bool(card_number) and calculate_check_digit(card_number[0:-1]) == card_number[-1]
 
 
 def add_check_digit(card_number: str) -> str:
@@ -50,4 +61,6 @@ def mask(card_number: str, mask_char: str = '*') -> str:
     :param mask_char: the character to use in masking
     :return: masked card number
     """
+    if len(card_number) <= 10:  # too short for first 6 / last 4 - only show last 4
+        return mask_char * max(len(card_number) - 4, 0) + card_number[-4:]
     return card_number[0:6] + mask_char * (len(card_number)-10) + card_number[-4:]

@@ -33,7 +33,7 @@ def cli_parser():
     parser.add_argument('--in-encoding')
     parser.add_argument('--out-encoding')
     parser.add_argument('--no1014blocking', action='store_true')
-    parser.add_argument('--config-file', help='File containing cardutil configuration - JSON format')
+    parser.add_argument('--config-file', help='File containing cardkit configuration - JSON format')
     parser.add_argument('--debug', action='store_true')
     add_version(parser)
 
@@ -46,7 +46,7 @@ def mci_csv_to_ipm(in_csv, out_ipm, config, out_encoding=None, no1014blocking=Fa
 
     :param in_csv: file object containing csv formatted data
     :param out_ipm: file object to receive IPM file
-    :param config: dict containing cardutil config
+    :param config: dict containing cardkit config
     :param out_encoding: The IPM file encoding. 'cp500' works for EBCDIC
     :param no1014blocking: set True 1014 blocking not required
     :return: None

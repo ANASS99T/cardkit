@@ -157,24 +157,27 @@ def _iso8583_to_dict(message, bit_config, encoding=DEFAULT_ENCODING, hex_bitmap=
     * key = 'TAGxxxx' icc fields
 
     """
-    LOGGER.debug(
-        "Processing message: len=%s contents:\n%s",
-        len(message), hexdump(message, result="return", encoding=encoding))
+    if LOGGER.isEnabledFor(logging.DEBUG):
+        LOGGER.debug(
+            "Processing message: len=%s contents:\n%s",
+            len(message), hexdump(message, result="return", encoding=encoding))
     # split raw message into components MessageType(4B), Bitmap(16B),
     # Message(l=*)
 
+    bitmap_unit = 16 if hex_bitmap else 8
     try:
-        if hex_bitmap:
-            message_length = len(message)-36
-            message_type_indicator, bitmap, message_data = struct.unpack(
-                "4s32s" + str(message_length) + "s", message)
-            binary_bitmap = binascii.unhexlify(bitmap)
-
-        else:
-            message_length = len(message)-20
-            message_type_indicator, binary_bitmap, message_data = struct.unpack(
-                "4s16s" + str(message_length) + "s", message)
-    except struct.error as ex:
+        message_type_indicator = message[:4]
+        bitmap = message[4:4 + bitmap_unit]
+        if len(message_type_indicator) != 4 or len(bitmap) != bitmap_unit:
+            raise ValueError('message too short for MTI and bitmap')
+        binary_bitmap = binascii.unhexlify(bitmap) if hex_bitmap else bitmap
+        if binary_bitmap[0] & 0x80:  # bit 1 on -> secondary bitmap present
+            bitmap = message[4:4 + 2 * bitmap_unit]
+            if len(bitmap) != 2 * bitmap_unit:
+                raise ValueError('message too short for secondary bitmap')
+            binary_bitmap = binascii.unhexlify(bitmap) if hex_bitmap else bitmap
+        message_data = message[4 + len(bitmap):]
+    except (ValueError, binascii.Error) as ex:
         raise Iso8583DataError('Failed unpacking bitmap values', binary_context_data=message, original_exception=ex)
     return_values = dict()
 
@@ -187,7 +190,7 @@ def _iso8583_to_dict(message, bit_config, encoding=DEFAULT_ENCODING, hex_bitmap=
     message_pointer = 0
     bitmap_list = _get_bitmap_list(binary_bitmap)
 
-    for bit in range(2, 128):
+    for bit in range(2, len(bitmap_list)):
         if bitmap_list[bit]:
             LOGGER.debug("processing bit %s", bit)
             # Check that config is available for this bit
@@ -235,6 +238,7 @@ def _dict_to_iso8583(message, bit_config, encoding=DEFAULT_ENCODING, hex_bitmap=
     * Message data - Remainder of record
 
     """
+    message = dict(message)  # never mutate the caller's dict
     output_data = b''
     bitmap_values = [False] * 128
     bitmap_values[0] = True  # set bit 1 on for presence of bitmap
@@ -244,20 +248,27 @@ def _dict_to_iso8583(message, bit_config, encoding=DEFAULT_ENCODING, hex_bitmap=
         [int(key) for key in bit_config if bit_config[key].get('field_processor') == 'PDS'], reverse=True)
     LOGGER.debug(de_pds_fields)
 
-    for de_field_value in _pds_to_de(message):
+    pds_values = _pds_to_de(message, encoding)
+    if len(pds_values) > len(de_pds_fields):
+        raise Iso8583DataError(
+            f'PDS data needs {len(pds_values)} fields but only {len(de_pds_fields)} PDS fields are configured')
+    for de_field_value in pds_values:
         de_field_key = de_pds_fields.pop()
         LOGGER.debug(f'de{de_field_key}={de_field_value}')
         message[f'DE{de_field_key}'] = de_field_value
 
-    for bit in range(2, 128):
+    for bit in range(2, 129):
         if message.get('DE' + str(bit)) or message.get('DE' + str(bit)) == 0:  # 0 evals to false, allow zero values
             LOGGER.debug(f'processing bit {bit}')
             bitmap_values[bit - 1] = True
             LOGGER.debug(message.get('DE' + str(bit)))
+            if not bit_config.get(str(bit)):
+                raise Iso8583DataError(f'No bit config available for bit {bit}')
             output_data += _field_to_iso8583(
                 bit_config[str(bit)],
                 message.get('DE' + str(bit)),
-                encoding=encoding)
+                encoding=encoding,
+                bit=bit)
 
     bitarray = BitArray()
     bitarray.fromlist(bitmap_values)
@@ -272,24 +283,30 @@ def _dict_to_iso8583(message, bit_config, encoding=DEFAULT_ENCODING, hex_bitmap=
     return output_string
 
 
-def _field_to_iso8583(bit_config, field_value, encoding=DEFAULT_ENCODING):
+def _field_to_iso8583(bit_config, field_value, encoding=DEFAULT_ENCODING, bit=None):
 
     output = b''
-    LOGGER.debug(f'bit_config={bit_config}, field_value={field_value}, encoding={encoding}')
+    LOGGER.debug('bit_config=%s, field_value=%s, encoding=%s', bit_config, field_value, encoding)
     field_value = _pytype_to_string(field_value, bit_config)
     field_length = bit_config.get('field_length')
     length_size = _get_field_length(bit_config)  # size of length for llvar and lllvar fields
+    if not isinstance(field_value, bytes):
+        field_value = str(field_value).encode(encoding)
 
     if length_size > 0:
         field_length = len(field_value)
+        if field_length >= 10 ** length_size:
+            raise Iso8583DataError(
+                f'DE{bit} value length {field_length} exceeds maximum for {bit_config["field_type"]} '
+                f'({10 ** length_size - 1})')
         output += format(field_length, '0' + str(length_size)).encode(encoding)
-
-    if isinstance(field_value, bytes):
-        output += field_value[:field_length]
+    elif len(field_value) > field_length:
+        raise Iso8583DataError(
+            f'DE{bit} value length {len(field_value)} exceeds fixed field length {field_length}')
     else:
-        output += format(field_value[:field_length], '<' + str(field_length)).encode(encoding)
+        field_value = field_value + ' '.encode(encoding) * (field_length - len(field_value))
 
-    return output
+    return output + field_value
 
 
 def _iso8583_to_field(bit, bit_config, message_data, encoding=DEFAULT_ENCODING):
@@ -491,7 +508,7 @@ def _get_bitmap_list(binary_bitmap):
     return bitmap_list
 
 
-def _pds_to_de(dict_values):
+def _pds_to_de(dict_values, encoding=DEFAULT_ENCODING):
     """
     takes all the pds fields values in dict (PDSxxxx) and creates list of DE strings
 
@@ -507,9 +524,11 @@ def _pds_to_de(dict_values):
     for key in keys:
         tag = int(key[3:])
         LOGGER.debug(f'tag={tag}')
-        length = len(dict_values[key])
+        length = len(str(dict_values[key]).encode(encoding))
         add_output = f'{tag:04}{length:03}{dict_values[key]}'
-        if len(output + add_output) > 999:
+        if length > 992:
+            raise Iso8583DataError(f'{key} value length {length} exceeds maximum PDS length (992)')
+        if len((output + add_output).encode(encoding)) > 999:
             outputs.append(output)
             output = ''
         output += add_output
@@ -573,86 +592,59 @@ def _icc_to_dict(field_data, processor_config=None):
     # Get error handling configuration from bit_config.
     DEFAULT_ERROR_HANDLING = 'WARN'
     on_error = (processor_config_dict.get('on_error') or DEFAULT_ERROR_HANDLING).upper()
-
-    TWO_BYTE_TAG_PREFIXES = [b'\x9f', b'\x5f']
+    def fail(msg):
+        if on_error == "ERROR":
+            raise Iso8583DataError("DE55: " + msg)
+        LOGGER.warning("DE55: %s", msg)
 
     field_pointer = 0
     return_values = {"ICC_DATA": binascii.b2a_hex(field_data).decode()}
 
     try:
         while field_pointer < len(field_data):
-            # get the tag id (one byte)
-            field_tag = field_data[field_pointer:field_pointer+1]
-            
-            # Check if there's data to read
-            if not field_tag:
-                if on_error == "ERROR":
-                    raise Iso8583DataError("DE55: No more data to read at position %d" % field_pointer)
-                LOGGER.warning("DE55: No more data to read at position %d", field_pointer)
-                break
-                
-            # set to 2 bytes if 2 byte tag
-            if field_tag in TWO_BYTE_TAG_PREFIXES:
-                # Check if there's enough data for 2-byte tag
-                if field_pointer + 1 >= len(field_data):
-                    if on_error == "ERROR":
-                        raise Iso8583DataError("DE55: Incomplete 2-byte tag at position %d" % field_pointer)
-                    LOGGER.warning("DE55: Incomplete 2-byte tag at position %d", field_pointer)
-                    break
-                field_tag = field_data[field_pointer:field_pointer+2]
-                field_pointer += 2
-            else:
-                field_pointer += 1
-
-            field_tag_display = binascii.b2a_hex(field_tag)
-            LOGGER.debug("field_tag_display=%s", field_tag_display)
+            tag_start = field_pointer
+            first = field_data[field_pointer]
+            field_pointer += 1
 
             # stop processing de55 if low values tag found
-            if field_tag_display == b'00':
+            if first == 0x00:
                 break
 
-            # Check if there's data for the length byte
+            # BER-TLV: low 5 bits all set -> tag continues while b8 of next byte is set
+            if first & 0x1F == 0x1F:
+                while field_pointer < len(field_data) and field_data[field_pointer] & 0x80:
+                    field_pointer += 1
+                field_pointer += 1
+                if field_pointer > len(field_data):
+                    fail("Incomplete multi-byte tag at position %d" % tag_start)
+                    break
+            field_tag = field_data[tag_start:field_pointer]
+            field_tag_display = binascii.b2a_hex(field_tag).upper().decode()
+
             if field_pointer >= len(field_data):
-                if on_error == "ERROR":
-                    raise Iso8583DataError("DE55: No length byte available for tag %s at position %d" %
-                                           (field_tag_display, field_pointer))
-                LOGGER.warning("DE55: No length byte available for tag %s at position %d",
-                               field_tag_display, field_pointer)
+                fail("No length byte available for tag %s at position %d" % (field_tag_display, field_pointer))
                 break
-                
-            field_length_raw = field_data[field_pointer:field_pointer+1]
-            LOGGER.debug(f"{field_length_raw=}")
-            
-            # Check if we got any data
-            if not field_length_raw:
-                if on_error == "ERROR":
-                    raise Iso8583DataError("DE55: Empty length byte for tag %s" % field_tag_display)
-                LOGGER.warning("DE55: Empty length byte for tag %s", field_tag_display)
-                break
-                
-            field_length = struct.unpack(">B", field_length_raw)[0]
 
-            LOGGER.debug("%s", format(field_tag_display))
-            LOGGER.debug(field_length)
+            # BER-TLV length: short form, or 0x81/0x82/... long form
+            field_length = field_data[field_pointer]
+            field_pointer += 1
+            if field_length & 0x80:
+                num_length_bytes = field_length & 0x7F
+                length_bytes = field_data[field_pointer:field_pointer + num_length_bytes]
+                if num_length_bytes == 0 or len(length_bytes) != num_length_bytes:
+                    fail("Invalid length for tag %s at position %d" % (field_tag_display, field_pointer))
+                    break
+                field_length = int.from_bytes(length_bytes, 'big')
+                field_pointer += num_length_bytes
 
-            # Check if there's enough data for the field value
-            end_pos = field_pointer + 1 + field_length
+            end_pos = field_pointer + field_length
             if end_pos > len(field_data):
-                if on_error == "ERROR":
-                    raise Iso8583DataError("DE55: Insufficient data for tag %s, expected %d bytes, only %d available" %
-                                           (field_tag_display, field_length, len(field_data) - field_pointer - 1))
-                LOGGER.warning("DE55: Insufficient data for tag %s, expected %d bytes, only %d available",
-                               field_tag_display, field_length, len(field_data) - field_pointer - 1)
+                fail("Insufficient data for tag %s, expected %d bytes, only %d available" %
+                     (field_tag_display, field_length, len(field_data) - field_pointer))
                 break
 
-            # get the tag data
-            de_field_data = field_data[field_pointer+1:end_pos]
-            de_field_data_display = binascii.b2a_hex(de_field_data).decode()
-            LOGGER.debug("%s", de_field_data_display)
-            return_values["TAG" + field_tag_display.upper().decode()] = de_field_data_display
-
-            # increment pointer to next TLV
-            field_pointer += 1 + field_length
+            return_values["TAG" + field_tag_display] = binascii.b2a_hex(field_data[field_pointer:end_pos]).decode()
+            field_pointer = end_pos
 
     except Exception as e:
         LOGGER.error("DE55: Error processing ICC data at position %d: %s", field_pointer, str(e))

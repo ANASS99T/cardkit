@@ -7,7 +7,8 @@ from cardkit import CardutilError
 from cardkit.config import config
 from cardkit.iso8583 import (
     BitArray, _iso8583_to_field, _field_to_iso8583, _iso8583_to_dict, _dict_to_iso8583, loads, dumps,
-    _pds_to_de, _pds_to_dict, _pytype_to_string, _icc_to_dict, _get_de43_fields, _get_date_from_string)
+    _pds_to_de, _pds_to_dict, _pytype_to_string, _icc_to_dict, _get_de43_fields, _get_date_from_string,
+    Iso8583DataError)
 
 from tests import message_ebcdic_raw, message_ascii_raw, message_ascii_raw_hex, message_ebcdic_raw_hex
 
@@ -133,9 +134,9 @@ class Iso8583TestCase(unittest.TestCase):
             b'041234', _field_to_iso8583({'field_type': 'LLVAR', 'field_python_type': 'int'}, 1234))
         self.assertEqual(
             b'041234', _field_to_iso8583({'field_type': 'LLVAR', 'field_python_type': 'int'}, '1234'))
-        # TODO Exception if field overflow
-        self.assertEqual(
-            b'123', _field_to_iso8583({'field_type': 'FIXED', 'field_python_type': 'int', 'field_length': 3}, 1234))
+        # cardkit: overflow raises instead of silently truncating (was b'123')
+        with self.assertRaises(Iso8583DataError):
+            _field_to_iso8583({'field_type': 'FIXED', 'field_python_type': 'int', 'field_length': 3}, 1234)
         self.assertEqual(
             b'01234', _field_to_iso8583({'field_type': 'FIXED', 'field_python_type': 'int', 'field_length': 5}, 1234))
 

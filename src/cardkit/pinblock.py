@@ -62,7 +62,7 @@ The encryption mixin's adds pin block encrption and decryption. Adds **from_enc_
 **to_enc_bytes** method.
 
 .. note:: The use of an encryption mix-in requires the install of additional modules.
-          Use ``pip install cardutil[crypto]``.
+          Use ``pip install cardkit[crypto]``.
 
 Available pinblock encryption mix-ins:
 
@@ -90,7 +90,7 @@ Pin verification values
 The pin verification mixin's add pin verification value calculators to the pinblock object. Adds **to_pvv** method.
 
 .. note:: The use of a pin verification mix-in requires the install of additional modules.
-          Use ``pip install cardutil[crypto]``.
+          Use ``pip install cardkit[crypto]``.
 
 Available pin verification mix-ins:
 
@@ -191,7 +191,9 @@ class Iso0PinBlock(AbstractPinBlock):
         p2 = f'0000{rightmost_12}'
         p1_bytes = int.from_bytes(pin_block, byteorder='big') ^ int(p2, 16)
         p1 = f'{p1_bytes:016x}'
-        pin_length = int(p1[1:2])
+        if p1[0] != '0':
+            raise ValueError(f'Not an ISO format 0 pin block (format nibble {p1[0]})')
+        pin_length = int(p1[1:2], 16)
         pin = p1[2:2 + pin_length]
         return cls(pin, card_number=card_number)
 
@@ -202,7 +204,7 @@ class Iso0PinBlock(AbstractPinBlock):
         :return: pin block as bytes
         """
         rightmost_12 = self.card_number[-13:-1]
-        p1 = f'{"0" + str(len(self.pin)) + self.pin:f<16}'
+        p1 = f'{"0" + format(len(self.pin), "X") + self.pin:f<16}'
         p2 = f'0000{rightmost_12}'
         pin_block = int(p1, 16) ^ int(p2, 16)
         return pin_block.to_bytes(8, byteorder='big')
@@ -232,20 +234,22 @@ class Iso4PinBlock(AbstractPinBlock):
     """
     def __init__(self, pin: str, random_value: int = None, **kwargs: any):
         super().__init__(pin, **kwargs)
-        if random_value:
+        if random_value is not None:
             self.random_value = random_value
         else:
             self.random_value = secrets.randbits(64)
             LOGGER.debug(f'random_value={self.random_value}')
 
     def to_bytes(self) -> bytes:
-        p1 = binascii.unhexlify(f'{"4" + str(len(self.pin)) + self.pin:a<16}{self.random_value:016x}')
+        p1 = binascii.unhexlify(f'{"4" + format(len(self.pin), "X") + self.pin:a<16}{self.random_value:016x}')
         return p1
 
     @classmethod
     def from_bytes(cls, pin_block: bytes, *args: any, **kwargs: any) -> AbstractPinBlock:
         p1 = binascii.hexlify(pin_block)
-        pin_length = int(p1[1:2])
+        if p1[0:1] != b'4':
+            raise ValueError(f'Not an ISO format 4 pin block (format nibble {p1[0:1].decode()})')
+        pin_length = int(p1[1:2], 16)
         pin = p1[2:2+pin_length]
         return cls(pin.decode())
 
