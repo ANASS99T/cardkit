@@ -6,7 +6,8 @@ import pytest
 from cardkit import mciipm
 from cardkit.cli import cardkit_cli
 from cardkit.ipmcsv import (
-    IpmFile, IpmRecord, IpmCsvError, FileId, get_field_specs, build_record, make_bitmap, read_ipm, write_ipm,
+    IpmFile, IpmRecord, IpmCsvError, FileId, get_field_specs, build_record, parse_record, make_bitmap, read_ipm,
+    write_ipm,
     read_csv, write_csv, convert_ipm_to_csv, convert_csv_to_ipm, ipm_bytes_to_csv_text, csv_text_to_ipm_bytes,
     add_header_trailer)
 
@@ -291,3 +292,70 @@ def test_header_processing_mode(tmp_path):
     ipm = read_csv(io.StringIO(HAND_MADE, newline=''))
     with pytest.raises(IpmCsvError, match='PDS 0122'):
         add_header_trailer(ipm, processing_mode='X')
+
+
+def test_parsed_records_always_rebuild_identically():
+    """read_ipm keeps a record parsed only if it rebuilds exactly - checked here on random data"""
+    rnd = random.Random(7)
+    for _ in range(2000):
+        if rnd.random() < 0.5:
+            record = bytes(rnd.getrandbits(8) for _ in range(rnd.randint(12, 200)))
+            record = record[:4] + bytes([record[4] & 0x7F]) + record[5:12] + record[12:]  # primary bitmap
+        else:
+            encoding = rnd.choice(['cp037', 'latin_1', 'cp500'])
+            record = rec(encoding, '1240', DE2='4' * rnd.randint(0, 19), DE3='000000',
+                         DE48=''.join(chr(rnd.randint(0, 255)) for _ in range(rnd.randint(0, 80))),
+                         DE55=bytes(rnd.getrandbits(8) for _ in range(rnd.randint(0, 120))))
+        for encoding in ('cp037', 'latin_1', 'cp500'):
+            try:
+                parsed = parse_record(record, SPECS, encoding)
+            except IpmCsvError:
+                continue
+            assert build_record(parsed, SPECS, encoding) == record
+
+
+# --- parallel conversion --------------------------------------------------------------------
+
+def _many_records(count):
+    base = sample_records('cp037')
+    odd = rec('cp037', '1240', DE2='5555444433332222') + b'X'  # kept raw
+    body = []
+    for i in range(count):
+        body.append(odd if i % 997 == 0 else rec('cp037', '1240', DE4=f'{i:012d}', DE71=f'{i:08d}',
+                                                    DE127=f'record {i:06d} ' + ' ' * (i % 7)))
+    return [base[0]] + body + [base[-1]]
+
+
+def test_parallel_matches_single_process_and_keeps_order(tmp_path):
+    data = vbs(_many_records(5000), blocked=True)
+    (tmp_path / 'in.ipm').write_bytes(data)
+    single = convert_ipm_to_csv(str(tmp_path / 'in.ipm'), str(tmp_path / 'one.csv'), workers=1)
+    multi = convert_ipm_to_csv(str(tmp_path / 'in.ipm'), str(tmp_path / 'many.csv'), workers=3)
+    assert single.verified and multi.verified
+    assert (tmp_path / 'one.csv').read_bytes() == (tmp_path / 'many.csv').read_bytes()
+    assert multi.raw_records == single.raw_records == 6
+    lines = (tmp_path / 'many.csv').read_text().splitlines()
+    assert [line.split(',')[0] for line in lines[2:]] == [f'"{n}"' for n in range(1, 5003)]
+    assert '"record 004999 ' in lines[-2]
+    back = convert_csv_to_ipm(str(tmp_path / 'many.csv'), str(tmp_path / 'back.ipm'), workers=3)
+    assert (tmp_path / 'back.ipm').read_bytes() == data and back.raw_records == 6 and back.records == 5002
+
+
+def test_parallel_csv_to_ipm_generates_header_trailer(tmp_path):
+    rows = ''.join(f'1240,5555444433332222,{i:012d},200,0023003POI,{i + 2:08d}\n' for i in range(3000))
+    (tmp_path / 'in.csv').write_text('MTI,DE2,DE4,DE24,DE48,DE71\n' + rows)
+    convert_csv_to_ipm(str(tmp_path / 'in.csv'), str(tmp_path / 'one.ipm'), workers=1)
+    result = convert_csv_to_ipm(str(tmp_path / 'in.csv'), str(tmp_path / 'many.ipm'), workers=4)
+    assert (tmp_path / 'one.ipm').read_bytes() == (tmp_path / 'many.ipm').read_bytes()
+    records = list(mciipm.IpmReader(io.BytesIO((tmp_path / 'many.ipm').read_bytes()), encoding='cp037'))
+    assert len(records) == 3002 and result.records == 3002
+    assert records[-1]['PDS0301'] == f'{sum(range(3000)):016d}' and records[-1]['PDS0306'] == '00003002'
+    assert [r['DE71'] for r in records[1:-1]] == list(range(2, 3002))
+
+
+def test_quoted_newline_in_hand_made_csv_falls_back_to_single_process(tmp_path):
+    rows = ''.join(f'1240,{i:08d},"x"\n' for i in range(2500)) + '1240,99999999,"two\nlines"\n'
+    (tmp_path / 'in.csv').write_text('MTI,DE71,DE127\n' + rows)
+    convert_csv_to_ipm(str(tmp_path / 'in.csv'), str(tmp_path / 'out.ipm'), workers=4, auto_header_trailer=False)
+    records = list(mciipm.IpmReader(io.BytesIO((tmp_path / 'out.ipm').read_bytes()), encoding='cp037'))
+    assert records[-1]['DE127'] == 'two\nlines' and len(records) == 2501

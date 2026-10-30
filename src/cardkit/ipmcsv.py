@@ -41,10 +41,13 @@ remembers that in its META row, so no header or trailer is added to it.
 """
 import csv
 import datetime
+import functools
 import hashlib
 import io
 import logging
+import os
 import typing
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 
 from cardkit import CardutilError
@@ -62,10 +65,40 @@ META_VERSION = '1'
 HEADER_FUNCTION_CODE = '697'
 TRAILER_FUNCTION_CODE = '695'
 FILE_CONTROL_MTI = '1644'
+PARALLEL_MIN_RECORDS = 20000  # files with fewer records are converted in a single process
 
 
 class IpmCsvError(CardutilError):
     pass
+
+
+@functools.lru_cache(maxsize=None)
+def _safe_bytes(encoding: str) -> bytes:
+    """
+    Bytes that decode to a single printable character (or space) and encode back to the same byte.
+    A value is CSV safe when ``value.translate(None, _safe_bytes(encoding))`` is empty.
+    """
+    safe = []
+    for byte in range(256):
+        try:
+            char = bytes([byte]).decode(encoding)
+        except UnicodeError:
+            continue
+        if len(char) == 1 and (char == ' ' or char.isprintable()) and char.encode(encoding) == bytes([byte]):
+            safe.append(byte)
+    return bytes(safe)
+
+
+@functools.lru_cache(maxsize=None)
+def _to_ascii_digits(encoding: str) -> bytes:
+    """
+    Translation table mapping the encoding's digit bytes to ASCII digits and every other byte to
+    ``x``, so a length prefix is valid only if it is exactly the encoding's digits.
+    """
+    table = bytearray(b'x' * 256)
+    for digit, byte in zip(b'0123456789', '0123456789'.encode(encoding)):
+        table[byte] = digit
+    return bytes(table)
 
 
 @dataclass(frozen=True)
@@ -163,29 +196,32 @@ def parse_record(record: bytes, specs: typing.Dict[int, FieldSpec], encoding: st
     bitmap = record[4:4 + bitmap_size]
     if len(bitmap) != bitmap_size:
         raise IpmCsvError('record too short for secondary bitmap')
-    bits = int.from_bytes(bitmap, 'big')
     bit_count = bitmap_size * 8
+    remaining = int.from_bytes(bitmap, 'big') & ~(1 << (bit_count - 1))  # bit 1 is not a field
+    digits = _to_ascii_digits(encoding)
     pos = 4 + bitmap_size
     fields = {}
-    for bit in range(2, bit_count + 1):
-        if not (bits >> (bit_count - bit)) & 1:
-            continue
+    while remaining:  # highest set bit first = lowest field number first
+        top = remaining.bit_length()
+        remaining ^= 1 << (top - 1)
+        bit = bit_count - top + 1
         spec = specs.get(bit)
         if spec is None:
             raise IpmCsvError(f'no field config for DE{bit}')
         if spec.length_size:
-            length_text = record[pos:pos + spec.length_size].decode(encoding)
-            if len(length_text) != spec.length_size or not _is_ascii_digits(length_text):
-                raise IpmCsvError(f'DE{bit}: invalid length prefix {length_text!r}')
-            length = int(length_text)
+            length_digits = record[pos:pos + spec.length_size].translate(digits)
+            if len(length_digits) != spec.length_size or not length_digits.isdigit():
+                raise IpmCsvError(f'DE{bit}: invalid length prefix '
+                                  f'{record[pos:pos + spec.length_size].decode(encoding, "replace")!r}')
+            length = int(length_digits)
             pos += spec.length_size
         else:
             length = spec.length
-        value = record[pos:pos + length]
-        if len(value) != length:
-            raise IpmCsvError(f'DE{bit}: expected {length} bytes, only {len(value)} available')
-        fields[bit] = value
-        pos += length
+        end = pos + length
+        if end > len(record):
+            raise IpmCsvError(f'DE{bit}: expected {length} bytes, only {len(record) - pos} available')
+        fields[bit] = record[pos:end]
+        pos = end
     if pos != len(record):
         raise IpmCsvError(f'{len(record) - pos} unexpected bytes after last field')
     return IpmRecord(mti=record[:4], bitmap=bitmap, fields=fields)
@@ -306,18 +342,12 @@ def fill_to_block(vbs_data: bytes) -> bytes:
     return vbs_data + b'\x40' * (-len(vbs_data) % BLOCK_DATA_SIZE)
 
 
-def read_ipm(data: bytes, encoding: str = None, blocked: bool = None,
-             bit_config: dict = None) -> IpmFile:
+def split_ipm(data: bytes, encoding: str = None,
+              blocked: bool = None) -> typing.Tuple[IpmFile, typing.List[bytes]]:
     """
-    Read IPM file bytes into an :class:`IpmFile`. Never fails on bad data: records that can't be
-    parsed are kept raw and unreadable data at the end is kept as ``tail``.
-
-    :param data: the IPM file contents
-    :param encoding: text encoding, default cp037
-    :param blocked: 1014 blocked file, detected when not given
-    :param bit_config: cardutil style bit config
+    Split IPM file bytes into its records (in file order) and an :class:`IpmFile` holding the
+    file details. The returned IpmFile has no records yet.
     """
-    specs = get_field_specs(bit_config)
     if blocked is None:
         blocked = is_1014_blocked(data)
     block_trailer, trailers = BLOCK_TRAILER, {}
@@ -332,11 +362,10 @@ def read_ipm(data: bytes, encoding: str = None, blocked: bool = None,
 
     ipm = IpmFile(encoding=encoding, blocked=blocked, block_trailer=block_trailer, block_trailers=trailers,
                   terminator=False)
+    records = []
     view = memoryview(vbs_data)
     pos = 0
-    while True:
-        if len(vbs_data) - pos < 4:
-            break
+    while len(vbs_data) - pos >= 4:
         length = int.from_bytes(view[pos:pos + 4], 'big')
         if length == 0:
             ipm.terminator = True
@@ -344,24 +373,41 @@ def read_ipm(data: bytes, encoding: str = None, blocked: bool = None,
             break
         if pos + 4 + length > len(vbs_data):
             LOGGER.warning('record %s: length %s runs past end of data - kept as trailing data',
-                           len(ipm.records) + 1, length)
+                           len(records) + 1, length)
             break
-        record_bytes = bytes(view[pos + 4:pos + 4 + length])
+        records.append(bytes(view[pos + 4:pos + 4 + length]))
         pos += 4 + length
-        ipm.records.append(_parse_or_raw(record_bytes, specs, encoding, len(ipm.records) + 1))
     ipm.tail = bytes(view[pos:])
+    return ipm, records
+
+
+def read_ipm(data: bytes, encoding: str = None, blocked: bool = None,
+             bit_config: dict = None) -> IpmFile:
+    """
+    Read IPM file bytes into an :class:`IpmFile`. Never fails on bad data: records that can't be
+    parsed are kept raw and unreadable data at the end is kept as ``tail``.
+
+    :param data: the IPM file contents
+    :param encoding: text encoding, default cp037
+    :param blocked: 1014 blocked file, detected when not given
+    :param bit_config: cardutil style bit config
+    """
+    specs = get_field_specs(bit_config)
+    ipm, records = split_ipm(data, encoding, blocked)
+    ipm.records = [_parse_or_raw(record, specs, ipm.encoding, number)
+                   for number, record in enumerate(records, start=1)]
     ipm.had_header = ipm.has_header
     ipm.had_trailer = ipm.has_trailer
     return ipm
 
 
 def _parse_or_raw(record_bytes, specs, encoding, record_number) -> IpmRecord:
+    # A successful parse always rebuilds identically: field bytes are kept as they are, length
+    # prefixes are fixed width digits, and the bitmap only has the parsed fields (plus bit 1 kept).
+    # The whole file check in convert_ipm_to_csv confirms this on every conversion.
     try:
-        record = parse_record(record_bytes, specs, encoding)
-        if build_record(record, specs, encoding) == record_bytes:
-            return record
-        LOGGER.warning('record %s: does not rebuild identically - kept raw', record_number)
-    except (IpmCsvError, UnicodeError) as ex:
+        return parse_record(record_bytes, specs, encoding)
+    except IpmCsvError as ex:
         LOGGER.warning('record %s: %s - kept raw', record_number, ex)
     return IpmRecord(raw=record_bytes)
 
@@ -370,15 +416,26 @@ def write_ipm(ipm: IpmFile, bit_config: dict = None) -> bytes:
     """
     Build IPM file bytes from an :class:`IpmFile`.
     """
-    specs = get_field_specs(bit_config)
+    return _finish_ipm(ipm, _vbs_records(ipm.records, get_field_specs(bit_config), ipm.encoding))
+
+
+def _vbs_records(records: typing.Iterable[IpmRecord], specs, encoding: str) -> bytes:
+    """
+    Records as VBS data: each record prefixed with its 4 byte length.
+    """
     parts = []
-    for record in ipm.records:
-        record_bytes = build_record(record, specs, ipm.encoding)
+    for record in records:
+        record_bytes = build_record(record, specs, encoding)
         parts.append(len(record_bytes).to_bytes(4, 'big'))
         parts.append(record_bytes)
-    if ipm.terminator:
-        parts.append(b'\x00\x00\x00\x00')
-    vbs_data = b''.join(parts)
+    return b''.join(parts)
+
+
+def _finish_ipm(ipm: IpmFile, records_data: bytes) -> bytes:
+    """
+    Complete VBS record data into the file: end of file record, trailing data and 1014 blocking.
+    """
+    vbs_data = records_data + (b'\x00\x00\x00\x00' if ipm.terminator else b'')
     if not ipm.blocked:
         return vbs_data + ipm.tail
     if (len(vbs_data) + len(ipm.tail)) % BLOCK_DATA_SIZE and not ipm.tail.strip(b'\x40'):
@@ -453,14 +510,52 @@ def add_header_trailer(ipm: IpmFile, file_id: FileId = None, header: bool = True
     :param processing_mode: header PDS 0122: ``P`` production or ``T`` test
     :return: list of messages describing what was added
     """
-    added = []
     enc = ipm.encoding
-    need_header, need_trailer = header and not ipm.has_header, trailer and not ipm.has_trailer
-    if not (need_header or need_trailer):
-        return added
+    first = ipm.records[0] if ipm.records else None
+    last = ipm.records[-1] if ipm.records else None
+    amount = sum(_amount(record, enc) for record in ipm.records) if trailer else 0
+    header_record, trailer_record, added = _file_control_records(
+        first, last, len(ipm.records), amount, enc, file_id, header, trailer, processing_mode)
+    if header_record:
+        ipm.records.insert(0, header_record)
+    if trailer_record:
+        ipm.records.append(trailer_record)
+    return added
 
-    existing = ipm.records[0] if ipm.has_header else ipm.records[-1] if ipm.has_trailer else None
-    file_id_value = _find_pds(existing.text(48, enc) or '', 105) if existing else None
+
+def _amount(record: IpmRecord, encoding: str) -> int:
+    """
+    DE4 amount of a record, 0 when it has none.
+    """
+    de4 = record.fields.get(4) if record.raw is None else None
+    if de4:
+        text = de4.decode(encoding)
+        if _is_ascii_digits(text):
+            return int(text)
+    return 0
+
+
+def _file_control_records(first: typing.Optional[IpmRecord], last: typing.Optional[IpmRecord], record_count: int,
+                          amount: int, encoding: str, file_id: FileId, header: bool, trailer: bool,
+                          processing_mode: str):
+    """
+    Header and trailer records to add (None when present or not wanted), and messages saying so.
+
+    :param first: first record of the file
+    :param last: last record of the file
+    :param record_count: number of records in the file
+    :param amount: sum of DE4 of all records
+    """
+    has_header = first is not None and first.is_file_control(encoding, HEADER_FUNCTION_CODE)
+    has_trailer = last is not None and last.is_file_control(encoding, TRAILER_FUNCTION_CODE)
+    need_header, need_trailer = header and not has_header, trailer and not has_trailer
+    header_record = trailer_record = None
+    added = []
+    if not (need_header or need_trailer):
+        return header_record, trailer_record, added
+
+    existing = first if has_header else last if has_trailer else None
+    file_id_value = _find_pds(existing.text(48, encoding) or '', 105) if existing else None
     if not file_id_value:
         file_id_value = str(file_id or FileId())
 
@@ -468,21 +563,16 @@ def add_header_trailer(ipm: IpmFile, file_id: FileId = None, header: bool = True
         if processing_mode not in ('P', 'T'):
             raise IpmCsvError(f'processing mode (PDS 0122) must be P or T, not {processing_mode!r}')
         pds_data = _pds(105, file_id_value) + _pds(122, processing_mode)
-        ipm.records.insert(0, _file_control_record(HEADER_FUNCTION_CODE, pds_data, 1, enc))
+        header_record = _file_control_record(HEADER_FUNCTION_CODE, pds_data, 1, encoding)
         added.append(f'file header (1644/697) with File ID {file_id_value}, processing mode {processing_mode}')
 
     if need_trailer:
-        amount = 0
-        for record in ipm.records:
-            de4 = record.text(4, enc) if record.raw is None else None
-            if de4 and _is_ascii_digits(de4):
-                amount += int(de4)
-        count = len(ipm.records) + 1
+        count = record_count + (1 if header_record else 0) + 1
         pds_data = (_pds(105, file_id_value) + _pds(301, f'{amount % 10 ** 16:016d}') +
                     _pds(306, f'{count:08d}'))
-        ipm.records.append(_file_control_record(TRAILER_FUNCTION_CODE, pds_data, count, enc))
+        trailer_record = _file_control_record(TRAILER_FUNCTION_CODE, pds_data, count, encoding)
         added.append(f'file trailer (1644/695): amount checksum {amount % 10 ** 16}, message count {count}')
-    return added
+    return header_record, trailer_record, added
 
 
 # --------------------------------------------------------------------------------------------
@@ -492,14 +582,23 @@ def add_header_trailer(ipm: IpmFile, file_id: FileId = None, header: bool = True
 def _encode_cell(value: bytes, spec: typing.Optional[FieldSpec], encoding: str) -> str:
     if spec is not None and spec.binary:
         return value.hex().upper()
-    try:
-        text = value.decode(encoding)
-    except UnicodeError:
+    if value.translate(None, _safe_bytes(encoding)):  # has bytes that are not printable text
         return HEX_PREFIX + value.hex().upper()
-    if (text.startswith(HEX_PREFIX) or text.encode(encoding) != value
-            or not all(ch == ' ' or ch.isprintable() for ch in text)):
+    text = value.decode(encoding)
+    if text.startswith(HEX_PREFIX):
         return HEX_PREFIX + value.hex().upper()
     return text
+
+
+@functools.lru_cache(maxsize=None)
+def _encoded_hex_prefix(encoding: str) -> bytes:
+    """
+    ``hex:`` in the file encoding: a CSV safe value starts with it exactly when its text does.
+    """
+    try:
+        return HEX_PREFIX.encode(encoding)
+    except UnicodeError:
+        return b'\xff' * 64  # can't occur in a value of this encoding
 
 
 def _decode_cell(cell: str, spec: typing.Optional[FieldSpec], encoding: str) -> bytes:
@@ -553,17 +652,38 @@ def write_csv(ipm: IpmFile, out_csv: typing.TextIO, bit_config: dict = None) -> 
     specs = get_field_specs(bit_config)
     used_bits = sorted({bit for record in ipm.records for bit in record.fields})
     columns = ['ROW', 'MTI', 'BITMAP'] + [f'DE{bit}' for bit in used_bits] + ['RAW']
-    writer = csv.writer(out_csv, quoting=csv.QUOTE_ALL, lineterminator='\n')
+    column_binary = _column_binary(used_bits, specs)
+    writer = _csv_writer(out_csv)
     writer.writerow(columns)
     writer.writerow([META_ROW] + [''] * (len(columns) - 2) + [_meta_to_string(ipm)])
-    for number, record in enumerate(ipm.records, start=1):
+    _write_record_rows(writer, ipm.records, 1, column_binary, ipm.encoding)
+
+
+def _csv_writer(out_csv: typing.TextIO):
+    return csv.writer(out_csv, quoting=csv.QUOTE_ALL, lineterminator='\n')
+
+
+def _column_binary(used_bits, specs) -> typing.List[typing.Tuple[int, bool]]:
+    return [(bit, bool(specs.get(bit) and specs[bit].binary)) for bit in used_bits]
+
+
+def _write_record_rows(writer, records: typing.Iterable[IpmRecord], first_number: int,
+                       column_binary: typing.List[typing.Tuple[int, bool]], encoding: str) -> None:
+    safe = _safe_bytes(encoding)
+    hex_prefix = _encoded_hex_prefix(encoding)
+    width = len(column_binary) + 2  # MTI, BITMAP, DE columns
+    for number, record in enumerate(records, start=first_number):
         if record.raw is not None:
-            writer.writerow([number] + [''] * (len(columns) - 2) + [record.raw.hex().upper()])
+            writer.writerow([number] + [''] * width + [record.raw.hex().upper()])
             continue
-        row = [number, _encode_cell(record.mti, None, ipm.encoding), record.bitmap.hex().upper()]
-        for bit in used_bits:
-            value = record.fields.get(bit)
-            row.append('' if value is None else _encode_cell(value, specs.get(bit), ipm.encoding))
+        fields = record.fields
+        row = [number, _encode_cell(record.mti, None, encoding), record.bitmap.hex().upper()]
+        # same rules as _encode_cell, inlined: this loop runs for every cell of the file
+        row += ['' if (value := fields.get(bit)) is None
+                else value.hex().upper() if binary
+                else value.decode(encoding) if not value.translate(None, safe) and not value.startswith(hex_prefix)
+                else HEX_PREFIX + value.hex().upper()
+                for bit, binary in column_binary]
         row.append('')
         writer.writerow(row)
 
@@ -577,25 +697,24 @@ def read_csv(in_csv: typing.TextIO, bit_config: dict = None, encoding: str = Non
     not blocked, with end of file marker. ``encoding`` and ``blocked`` override either.
     """
     specs = get_field_specs(bit_config)
-    reader = csv.DictReader(in_csv)
-    if not reader.fieldnames or 'MTI' not in reader.fieldnames and 'RAW' not in reader.fieldnames:
+    reader = csv.reader(in_csv)
+    header = next(reader, None)
+    if not header or 'MTI' not in header and 'RAW' not in header:
         raise IpmCsvError('CSV must have an MTI or RAW column')
-    de_columns = []
-    for name in reader.fieldnames:
-        if name.upper().startswith('DE') and name[2:].isdigit():
-            de_columns.append((name, int(name[2:])))
+    width, row_col, mti_col, bitmap_col, raw_col, de_columns = _csv_layout(header, specs)
     ipm = IpmFile()
     meta = None
     for line_number, row in enumerate(reader, start=2):
+        if len(row) < width:
+            row += [''] * (width - len(row))
         try:
-            if (row.get('ROW') or '').strip().upper() == META_ROW:
-                meta = _meta_from_string(row.get('RAW') or '')
+            if row_col is not None and row[row_col].strip().upper() == META_ROW:
+                meta = _meta_from_string(row[raw_col] if raw_col is not None else '')
                 for key, value in meta.items():
                     setattr(ipm, key, value)
                 continue
-            if encoding:
-                ipm.encoding = encoding
-            ipm.records.append(_row_to_record(row, de_columns, specs, ipm.encoding))
+            ipm.records.append(_row_to_record(row, mti_col, bitmap_col, raw_col, de_columns,
+                                              encoding or ipm.encoding))
         except (ValueError, UnicodeError, IpmCsvError) as ex:
             raise IpmCsvError(f'CSV line {line_number}: {ex}') from ex
     if meta is None:
@@ -607,27 +726,47 @@ def read_csv(in_csv: typing.TextIO, bit_config: dict = None, encoding: str = Non
     return ipm
 
 
-def _row_to_record(row: dict, de_columns, specs, encoding) -> IpmRecord:
-    raw = (row.get('RAW') or '').strip()
+def _csv_layout(header: typing.List[str], specs):
+    """
+    Column positions: width, ROW, MTI, BITMAP, RAW (None when missing) and DE columns as
+    (index, bit, binary, name).
+    """
+    position = {name: index for index, name in enumerate(header)}
+    row_col, mti_col, bitmap_col, raw_col = (position.get(name) for name in ('ROW', 'MTI', 'BITMAP', 'RAW'))
+    de_columns = []
+    for index, name in enumerate(header):
+        if name.upper().startswith('DE') and name[2:].isdigit():
+            bit = int(name[2:])
+            de_columns.append((index, bit, bool(specs.get(bit) and specs[bit].binary), name))
+    return len(header), row_col, mti_col, bitmap_col, raw_col, de_columns
+
+
+def _row_to_record(row: list, mti_col, bitmap_col, raw_col, de_columns, encoding) -> IpmRecord:
+    raw = row[raw_col].strip() if raw_col is not None else ''
     if raw:
         return IpmRecord(raw=bytes.fromhex(raw))
-    mti_cell = row.get('MTI') or ''
+    mti_cell = row[mti_col] if mti_col is not None else ''
     if not mti_cell:
         raise IpmCsvError('MTI is empty')
-    bitmap_cell = (row.get('BITMAP') or '').strip()
+    bitmap_cell = row[bitmap_col].strip() if bitmap_col is not None else ''
     bitmap = bytes.fromhex(bitmap_cell) if bitmap_cell else b''
-    bitmap_bits = int.from_bytes(bitmap, 'big') if bitmap else 0
-    bit_count = len(bitmap) * 8
     fields = {}
-    for column, bit in de_columns:
-        cell = row.get(column) or ''
-        in_bitmap = bitmap and bit <= bit_count and (bitmap_bits >> (bit_count - bit)) & 1
-        if cell == '' and not in_bitmap:
-            continue
-        try:
-            fields[bit] = _decode_cell(cell, specs.get(bit), encoding)
-        except ValueError as ex:
-            raise IpmCsvError(f'{column}: {ex}') from ex
+    name = None
+    try:
+        for index, bit, binary, name in de_columns:
+            cell = row[index]
+            if not cell:
+                # empty cell: field is present (and empty) only when its bit is set in BITMAP
+                if bitmap and bit <= len(bitmap) * 8 and bitmap[(bit - 1) // 8] & (0x80 >> ((bit - 1) % 8)):
+                    fields[bit] = b''
+            elif binary:
+                fields[bit] = bytes.fromhex(cell)
+            elif cell.startswith(HEX_PREFIX):
+                fields[bit] = bytes.fromhex(cell[len(HEX_PREFIX):])
+            else:
+                fields[bit] = cell.encode(encoding)
+    except ValueError as ex:
+        raise IpmCsvError(f'{name}: {ex}') from ex
     return IpmRecord(mti=_decode_cell(mti_cell, None, encoding), bitmap=bitmap, fields=fields)
 
 
@@ -646,54 +785,253 @@ class ConversionResult:
     messages: typing.List[str] = field(default_factory=list)
 
 
-def convert_ipm_to_csv(in_filename: str, out_filename: str, encoding: str = None, blocked: bool = None,
-                       bit_config: dict = None, verify: bool = True) -> ConversionResult:
+def resolve_workers(workers: typing.Optional[int], record_count: int) -> int:
     """
-    Convert an IPM file to CSV. With ``verify`` the written CSV is converted back in memory and
-    compared with the original file; :class:`IpmCsvError` is raised if they differ.
+    Number of processes to use. ``None`` means automatic: one per CPU (at most 8) for files of
+    at least PARALLEL_MIN_RECORDS records, otherwise 1.
+    """
+    if workers is None:
+        workers = min(os.cpu_count() or 1, 8) if record_count >= PARALLEL_MIN_RECORDS else 1
+    return max(1, workers)
+
+
+def _chunks(items: list, workers: int) -> typing.List[typing.Tuple[int, list]]:
+    """
+    Split into consecutive chunks (start index, items) - order is kept when joined back.
+    """
+    size = max(1000, -(-len(items) // (workers * 4))) if workers > 1 else max(len(items), 1)
+    return [(start, items[start:start + size]) for start in range(0, len(items), size)]
+
+
+class _Runner:
+    """
+    Runs chunk jobs in order, in a process pool when more than one worker is wanted.
+    """
+    def __init__(self, workers: int):
+        self.pool = ProcessPoolExecutor(workers) if workers > 1 else None
+
+    def map(self, func, jobs):
+        return list(self.pool.map(func, jobs) if self.pool else map(func, jobs))
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        if self.pool:
+            self.pool.shutdown()
+
+
+def _job_used_bits(job):
+    records, first_number, encoding, bit_config = job
+    specs = get_field_specs(bit_config)
+    bits, raw = set(), []
+    for number, record in enumerate(records, start=first_number):
+        try:
+            bits.update(parse_record(record, specs, encoding).fields)
+        except IpmCsvError as ex:
+            raw.append((number, str(ex)))
+    return bits, raw
+
+
+def _job_csv_rows(job):
+    records, first_number, encoding, bit_config, used_bits = job
+    specs = get_field_specs(bit_config)
+    parsed = []
+    for record in records:
+        try:
+            parsed.append(parse_record(record, specs, encoding))
+        except IpmCsvError:
+            parsed.append(IpmRecord(raw=record))
+    out = io.StringIO(newline='')
+    _write_record_rows(_csv_writer(out), parsed, first_number, _column_binary(used_bits, specs), encoding)
+    return out.getvalue()
+
+
+def _job_csv_lines_to_vbs(job):
+    """
+    CSV lines to VBS record data. Returns data, record count, DE4 total, first and last record,
+    any META row values found, and the number of RAW records.
+    """
+    lines, first_line_number, header, encoding, bit_config = job
+    specs = get_field_specs(bit_config)
+    width, row_col, mti_col, bitmap_col, raw_col, de_columns = _csv_layout(header, specs)
+    parts, metas, records = [], [], []
+    count = amount = raw_count = 0
+    first = last = None
+    for line_number, row in enumerate(csv.reader(lines, strict=True), start=first_line_number):
+        if len(row) < width:
+            row += [''] * (width - len(row))
+        try:
+            if row_col is not None and row[row_col].strip().upper() == META_ROW:
+                metas.append(row[raw_col] if raw_col is not None else '')
+                continue
+            record = _row_to_record(row, mti_col, bitmap_col, raw_col, de_columns, encoding)
+            record_bytes = build_record(record, specs, encoding)
+        except (ValueError, UnicodeError, IpmCsvError) as ex:
+            raise IpmCsvError(f'CSV line {line_number}: {ex}') from ex
+        parts.append(len(record_bytes).to_bytes(4, 'big'))
+        parts.append(record_bytes)
+        amount += _amount(record, encoding)
+        count += 1
+        raw_count += record.raw is not None
+        first = first or record
+        last = record
+    return b''.join(parts), count, amount, first, last, metas, raw_count
+
+
+def _csv_text_to_vbs(text: str, runner: _Runner, workers: int, encoding: typing.Optional[str],
+                     bit_config: dict):
+    """
+    CSV text to (IpmFile with file details, VBS record data, record count, DE4 total, first, last,
+    RAW record count).
+    Rows are processed in chunks and joined in order.
+    """
+    lines = text.split('\n')
+    if lines and lines[-1] == '':
+        lines.pop()
+    lines = [line + '\n' for line in lines]  # keep line ends: a quoted value may span lines
+    header = next(csv.reader(lines[:1]), None)
+    if not header or 'MTI' not in header and 'RAW' not in header:
+        raise IpmCsvError('CSV must have an MTI or RAW column')
+    ipm = IpmFile()
+    meta = None
+    body = lines[1:]
+    # META row first so the encoding is known before rows are converted
+    if body and body[0].startswith(f'"{META_ROW}"') or body and body[0].startswith(f'{META_ROW},'):
+        meta_row = next(csv.reader(body[:1]))
+        raw_col = header.index('RAW') if 'RAW' in header else None
+        meta = _meta_from_string(meta_row[raw_col] if raw_col is not None and raw_col < len(meta_row) else '')
+        body = body[1:]
+    if meta:
+        for key, value in meta.items():
+            setattr(ipm, key, value)
+    else:
+        ipm.had_header = ipm.had_trailer = True  # hand made CSV: generate header/trailer if missing
+    if encoding:
+        ipm.encoding = encoding
+    first_line = 3 if meta else 2
+    jobs = [(chunk, first_line + start, header, ipm.encoding, bit_config) for start, chunk in _chunks(body, workers)]
+    results = runner.map(_job_csv_lines_to_vbs, jobs)
+    for result in results:
+        for meta_value in result[5]:
+            for key, value in _meta_from_string(meta_value).items():
+                setattr(ipm, key, value)
+    if encoding:
+        ipm.encoding = encoding
+    records_data = b''.join(result[0] for result in results)
+    count = sum(result[1] for result in results)
+    amount = sum(result[2] for result in results)
+    firsts = [result[3] for result in results if result[3] is not None]
+    lasts = [result[4] for result in results if result[4] is not None]
+    raw_count = sum(result[6] for result in results)
+    return (ipm, records_data, count, amount, (firsts[0] if firsts else None), (lasts[-1] if lasts else None),
+            raw_count)
+
+
+def _lines_safe_to_split(text: str) -> bool:
+    """
+    True when no quoted CSV value spans lines: every line has an even number of quote characters.
+    Always true for CSVs written by cardkit (control characters are written as hex).
+    """
+    return not any(line.count('"') % 2 for line in text.split('\n'))
+
+
+def convert_ipm_to_csv(in_filename: str, out_filename: str, encoding: str = None, blocked: bool = None,
+                       bit_config: dict = None, verify: bool = True, workers: int = None) -> ConversionResult:
+    """
+    Convert an IPM file to CSV. With ``verify`` the written CSV is converted back and compared
+    with the original file; :class:`IpmCsvError` is raised if they differ.
+
+    Large files are processed by several processes (``workers``, automatic by default). Records
+    are always written in file order.
     """
     with open(in_filename, 'rb') as in_file:
         data = in_file.read()
-    ipm = read_ipm(data, encoding=encoding, blocked=blocked, bit_config=bit_config)
-    with open(out_filename, 'w', encoding='utf-8', newline='') as out_csv:
-        write_csv(ipm, out_csv, bit_config)
+    ipm, records = split_ipm(data, encoding, blocked)
+    workers = resolve_workers(workers, len(records))
+    specs = get_field_specs(bit_config)
+    if records:
+        ipm.records = [_parse_or_raw(records[0], specs, ipm.encoding, 1)]
+        ipm.had_header = ipm.has_header
+        ipm.records = [_parse_or_raw(records[-1], specs, ipm.encoding, len(records))]
+        ipm.had_trailer = ipm.has_trailer
+        ipm.records = []
+    else:
+        ipm.had_header = ipm.had_trailer = False
 
-    result = ConversionResult(
-        records=len(ipm.records), raw_records=sum(r.raw is not None for r in ipm.records),
-        encoding=ipm.encoding, blocked=ipm.blocked, sha256=hashlib.sha256(data).hexdigest())
-    if not ipm.had_header:
-        result.messages.append('file has no header record')
-    if not ipm.had_trailer:
-        result.messages.append('file has no trailer record')
-    if ipm.tail and not (ipm.blocked and set(ipm.tail) == {0x40}):
-        result.messages.append(f'{len(ipm.tail)} bytes of trailing data kept in META row')
-    if verify:
-        with open(out_filename, 'r', encoding='utf-8-sig', newline='') as in_csv:
-            rebuilt = write_ipm(read_csv(in_csv, bit_config), bit_config)
-        result.verified = rebuilt == data
-        if not result.verified:
-            raise IpmCsvError(f'verification failed: CSV {out_filename} does not rebuild {in_filename}')
+    with _Runner(workers) as runner:
+        chunks = _chunks(records, workers)
+        used_bits, raw = set(), []
+        for bits, chunk_raw in runner.map(_job_used_bits, [(chunk, start + 1, ipm.encoding, bit_config)
+                                                            for start, chunk in chunks]):
+            used_bits |= bits
+            raw += chunk_raw
+        for number, reason in raw:
+            LOGGER.warning('record %s: %s - kept raw', number, reason)
+        used_bits = sorted(used_bits)
+        columns = ['ROW', 'MTI', 'BITMAP'] + [f'DE{bit}' for bit in used_bits] + ['RAW']
+        texts = runner.map(_job_csv_rows, [(chunk, start + 1, ipm.encoding, bit_config, used_bits)
+                                           for start, chunk in chunks])
+        with open(out_filename, 'w', encoding='utf-8', newline='') as out_csv:
+            writer = _csv_writer(out_csv)
+            writer.writerow(columns)
+            writer.writerow([META_ROW] + [''] * (len(columns) - 2) + [_meta_to_string(ipm)])
+            out_csv.writelines(texts)
+
+        result = ConversionResult(records=len(records), raw_records=len(raw), encoding=ipm.encoding,
+                                  blocked=ipm.blocked, sha256=hashlib.sha256(data).hexdigest())
+        if not ipm.had_header:
+            result.messages.append('file has no header record')
+        if not ipm.had_trailer:
+            result.messages.append('file has no trailer record')
+        if ipm.tail and not (ipm.blocked and set(ipm.tail) == {0x40}):
+            result.messages.append(f'{len(ipm.tail)} bytes of trailing data kept in META row')
+        if verify:
+            with open(out_filename, 'r', encoding='utf-8-sig', newline='') as in_csv:
+                text = in_csv.read()
+            rebuilt_ipm, records_data, *_ = _csv_text_to_vbs(text, runner, workers, None, bit_config)
+            result.verified = _finish_ipm(rebuilt_ipm, records_data) == data
+            if not result.verified:
+                raise IpmCsvError(f'verification failed: CSV {out_filename} does not rebuild {in_filename}')
     return result
 
 
 def convert_csv_to_ipm(in_filename: str, out_filename: str, encoding: str = None, blocked: bool = None,
                        bit_config: dict = None, auto_header_trailer: bool = True,
-                       file_id: FileId = None, processing_mode: str = 'P') -> ConversionResult:
+                       file_id: FileId = None, processing_mode: str = 'P', workers: int = None) -> ConversionResult:
     """
     Convert a CSV to an IPM file, generating header and trailer records when missing
     (unless the CSV came from an IPM file that had none, or ``auto_header_trailer`` is False).
+
+    Large files are processed by several processes (``workers``, automatic by default). Records
+    are always written in CSV order.
     """
     with open(in_filename, 'r', encoding='utf-8-sig', newline='') as in_csv:
-        ipm = read_csv(in_csv, bit_config, encoding=encoding, blocked=blocked)
+        text = in_csv.read()
+    if not _lines_safe_to_split(text):
+        workers = 1  # a quoted value spans lines (hand made CSV) - rows can't be split by line
+    workers = resolve_workers(workers, text.count('\n'))
+    with _Runner(workers) as runner:
+        ipm, records_data, count, amount, first, last, raw_count = _csv_text_to_vbs(
+            text, runner, workers, encoding, bit_config)
+    if blocked is not None:
+        ipm.blocked = blocked
     result = ConversionResult(encoding=ipm.encoding, blocked=ipm.blocked)
     if auto_header_trailer:
-        result.messages += add_header_trailer(ipm, file_id, header=ipm.had_header, trailer=ipm.had_trailer,
-                                              processing_mode=processing_mode)
-    data = write_ipm(ipm, bit_config)
+        header_record, trailer_record, result.messages = _file_control_records(
+            first, last, count, amount, ipm.encoding, file_id, ipm.had_header, ipm.had_trailer, processing_mode)
+        specs = get_field_specs(bit_config)
+        if header_record:
+            records_data = _vbs_records([header_record], specs, ipm.encoding) + records_data
+            count += 1
+        if trailer_record:
+            records_data += _vbs_records([trailer_record], specs, ipm.encoding)
+            count += 1
+    data = _finish_ipm(ipm, records_data)
     with open(out_filename, 'wb') as out_file:
         out_file.write(data)
-    result.records = len(ipm.records)
-    result.raw_records = sum(r.raw is not None for r in ipm.records)
+    result.records = count
+    result.raw_records = raw_count
     result.sha256 = hashlib.sha256(data).hexdigest()
     return result
 

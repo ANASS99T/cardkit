@@ -37,6 +37,8 @@ def cli_parser():
                              help='1014 blocked IPM file')
         blocked.add_argument('--unblocked', dest='blocked', action='store_false', help='plain VBS IPM file')
         sub.add_argument('--config-file', help='cardutil/cardkit JSON configuration (bit_config)')
+        sub.add_argument('--workers', type=int, help='processes to use (default: one per CPU, up to 8, '
+                                                     'for files of 20,000+ records; 1 = single process)')
 
     to_csv = commands.add_parser('ipm2csv', help='convert IPM file to CSV (lossless)')
     common(to_csv)
@@ -70,13 +72,14 @@ def cli_run(argv):
         if args.command == 'ipm2csv':
             out = args.out_filename or args.in_filename + '.csv'
             result = convert_ipm_to_csv(args.in_filename, out, encoding=args.encoding, blocked=args.blocked,
-                                        bit_config=bit_config, verify=args.verify)
+                                        bit_config=bit_config, verify=args.verify, workers=args.workers)
         else:
             out = args.out_filename or args.in_filename + '.ipm'
             file_id = FileId(args.file_type, args.file_date, args.processor_id, args.file_seq)
             result = convert_csv_to_ipm(args.in_filename, out, encoding=args.encoding, blocked=args.blocked,
                                         bit_config=bit_config, auto_header_trailer=args.auto_header_trailer,
-                                        file_id=file_id, processing_mode=args.processing_mode)
+                                        file_id=file_id, processing_mode=args.processing_mode,
+                                        workers=args.workers)
     except (IpmCsvError, OSError) as ex:
         print(f'cardkit: error: {ex}', file=sys.stderr)
         return 1

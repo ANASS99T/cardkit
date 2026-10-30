@@ -28,6 +28,18 @@ The encoding is **always EBCDIC cp037** unless you pass `--encoding` (for exampl
 
 `ipm2csv` then **verifies** that the CSV rebuilds the identical file. If it doesn't, it fails instead of handing you a lossy CSV.
 
+### Speed on large files
+
+Files with 20,000 or more records are split into chunks and converted on several CPU cores, one process per core up to 8. The chunks are joined back in their original order, so records keep their exact order and the CSV is byte-identical to a single-process run. Use `--workers N` to choose the number of processes (`--workers 1` for a single process).
+
+100,002 records (72 MB, cp037, 1014-blocked), on a 10-core Mac:
+
+| | `--workers 1` | default |
+|---|---|---|
+| `ipm2csv` (includes verification) | 5.8 s | 1.8 s |
+| `ipm2csv --no-verify` | 3.6 s | 1.0 s |
+| `csv2ipm` | 2.4 s | 0.85 s |
+
 ### What's in the CSV
 
 | Column | Content |
