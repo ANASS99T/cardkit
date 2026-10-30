@@ -242,3 +242,19 @@ def test_cli_roundtrip(tmp_path, capsys):
     assert cardkit_cli.cli_run(['csv2ipm', str(tmp_path / 'f.ipm.csv'), '-o', str(tmp_path / 'g.ipm')]) == 0
     assert cardkit_cli.cli_run(['compare', str(tmp_path / 'f.ipm'), str(tmp_path / 'g.ipm')]) == 0
     assert 'verified' in capsys.readouterr().out
+
+
+def test_blocked_with_zero_block_trailers():
+    """some producers end each 1014 block with x'0000' instead of x'4040'"""
+    records = sample_records('cp500')
+    standard = vbs(records[:1] + records[1:3] * 3 + records[3:], blocked=True)
+    data = b''.join(standard[i:i + 1012] + b'\x00\x00' for i in range(0, len(standard), 1014))
+    ipm = read_ipm(data)
+    assert ipm.blocked and ipm.block_trailer == b'\x00\x00' and ipm.block_trailers == {}
+    assert len(ipm.records) == 8 and all(r.raw is None for r in ipm.records)
+    rebuilt, text = roundtrip(data)
+    assert rebuilt == data and 'block_trailer=0000' in text
+    # edited records are reblocked with the same trailer
+    edited = csv_text_to_ipm_bytes(text.replace('"free text 0000 "', '"' + 'z' * 600 + '"'))
+    assert len(edited) % 1014 == 0
+    assert {edited[i - 2:i] for i in range(1014, len(edited) + 1, 1014)} == {b'\x00\x00'}

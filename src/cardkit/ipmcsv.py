@@ -130,7 +130,8 @@ class IpmFile:
     blocked: bool = False
     terminator: bool = True                    # zero length record at end of VBS data
     tail: bytes = b''                          # bytes after the terminator (incl. 1014 fill)
-    block_trailers: typing.Dict[int, bytes] = field(default_factory=dict)  # non x'4040' trailers
+    block_trailer: bytes = BLOCK_TRAILER       # 2 bytes ending each 1014 block
+    block_trailers: typing.Dict[int, bytes] = field(default_factory=dict)  # blocks ending differently
     had_header: bool = True
     had_trailer: bool = True
 
@@ -234,13 +235,29 @@ def build_record(record: IpmRecord, specs: typing.Dict[int, FieldSpec], encoding
 # file level
 # --------------------------------------------------------------------------------------------
 
+def _vbs_ends_cleanly(vbs_data: bytes) -> bool:
+    """
+    True if the VBS record chain reaches a zero length end of file record.
+    """
+    pos = 0
+    while len(vbs_data) - pos >= 4:
+        length = int.from_bytes(vbs_data[pos:pos + 4], 'big')
+        if length == 0:
+            return pos > 0
+        pos += 4 + length
+    return False
+
+
 def is_1014_blocked(data: bytes) -> bool:
     """
-    True if every complete 1014 block ends with x'4040' and the data is multiple blocks long.
+    True if the data is whole 1014 blocks and either every block ends with x'4040', or the records
+    only line up once the 2 byte block trailers (whatever their value, e.g. x'0000') are removed.
     """
     if len(data) < BLOCK_SIZE or len(data) % BLOCK_SIZE:
         return False
-    return all(data[end - 2:end] == BLOCK_TRAILER for end in range(BLOCK_SIZE, len(data) + 1, BLOCK_SIZE))
+    if all(data[end - 2:end] == BLOCK_TRAILER for end in range(BLOCK_SIZE, len(data) + 1, BLOCK_SIZE)):
+        return True
+    return _vbs_ends_cleanly(unblock(data)[0]) and not _vbs_ends_cleanly(data)
 
 
 def detect_encoding(vbs_data: bytes) -> str:
@@ -255,29 +272,33 @@ def detect_encoding(vbs_data: bytes) -> str:
     return 'latin_1'
 
 
-def unblock(data: bytes) -> typing.Tuple[bytes, typing.Dict[int, bytes]]:
+def unblock(data: bytes) -> typing.Tuple[bytes, bytes, typing.Dict[int, bytes]]:
     """
-    Remove 1014 blocking. Returns unblocked data and any block trailers that are not x'4040'.
+    Remove 1014 blocking.
+
+    :return: unblocked data, the block trailer used by most blocks, and the blocks whose
+        trailer differs from it (keyed by block index)
     """
-    chunks = []
-    trailers = {}
-    for index, start in enumerate(range(0, len(data), BLOCK_SIZE)):
-        block = data[start:start + BLOCK_SIZE]
-        chunks.append(block[:BLOCK_DATA_SIZE])
-        if block[BLOCK_DATA_SIZE:] != BLOCK_TRAILER:
-            trailers[index] = block[BLOCK_DATA_SIZE:]
-    return b''.join(chunks), trailers
+    blocks = [data[start:start + BLOCK_SIZE] for start in range(0, len(data), BLOCK_SIZE)]
+    trailers = [block[BLOCK_DATA_SIZE:] for block in blocks]
+    full = [trailer for trailer in trailers if len(trailer) == 2]
+    block_trailer = max(set(full), key=full.count) if full else BLOCK_TRAILER
+    exceptions = {index: trailer for index, trailer in enumerate(trailers) if trailer != block_trailer}
+    return b''.join(block[:BLOCK_DATA_SIZE] for block in blocks), block_trailer, exceptions
 
 
-def reblock(data: bytes, trailers: typing.Dict[int, bytes] = None) -> bytes:
+def reblock(data: bytes, block_trailer: bytes = BLOCK_TRAILER, trailers: typing.Dict[int, bytes] = None) -> bytes:
     """
     Apply 1014 blocking to data that already includes its fill characters.
+
+    :param block_trailer: 2 bytes ending each block
+    :param trailers: blocks (by index) ending with different bytes
     """
     trailers = trailers or {}
     out = []
     for index, start in enumerate(range(0, len(data), BLOCK_DATA_SIZE)):
         out.append(data[start:start + BLOCK_DATA_SIZE])
-        out.append(trailers.get(index, BLOCK_TRAILER))
+        out.append(trailers.get(index, block_trailer))
     return b''.join(out)
 
 
@@ -302,14 +323,15 @@ def read_ipm(data: bytes, encoding: str = None, blocked: bool = None,
     specs = get_field_specs(bit_config)
     if blocked is None:
         blocked = is_1014_blocked(data)
-    trailers = {}
+    block_trailer, trailers = BLOCK_TRAILER, {}
     vbs_data = data
     if blocked:
-        vbs_data, trailers = unblock(data)
+        vbs_data, block_trailer, trailers = unblock(data)
     if encoding is None:
         encoding = detect_encoding(vbs_data)
 
-    ipm = IpmFile(encoding=encoding, blocked=blocked, block_trailers=trailers, terminator=False)
+    ipm = IpmFile(encoding=encoding, blocked=blocked, block_trailer=block_trailer, block_trailers=trailers,
+                  terminator=False)
     view = memoryview(vbs_data)
     pos = 0
     while True:
@@ -361,8 +383,8 @@ def write_ipm(ipm: IpmFile, bit_config: dict = None) -> bytes:
         return vbs_data + ipm.tail
     if (len(vbs_data) + len(ipm.tail)) % BLOCK_DATA_SIZE and not ipm.tail.strip(b'\x40'):
         # records changed size so the original fill no longer completes the last block
-        return reblock(fill_to_block(vbs_data), ipm.block_trailers)
-    return reblock(vbs_data + ipm.tail, ipm.block_trailers)
+        return reblock(fill_to_block(vbs_data), ipm.block_trailer, ipm.block_trailers)
+    return reblock(vbs_data + ipm.tail, ipm.block_trailer, ipm.block_trailers)
 
 
 # --------------------------------------------------------------------------------------------
@@ -494,6 +516,7 @@ def _meta_to_string(ipm: IpmFile) -> str:
         ('trailer', int(ipm.had_trailer)),
         # x'40' fill (normal for 1014 blocked files) as a count, anything else as hex
         ('fill', len(ipm.tail)) if ipm.tail and not ipm.tail.strip(b'\x40') else ('tail', ipm.tail.hex().upper()),
+        ('block_trailer', ipm.block_trailer.hex().upper()),
         ('trailers', ','.join(f'{i}:{t.hex().upper()}' for i, t in sorted(ipm.block_trailers.items()))),
     ]
     return ';'.join(f'{k}={v}' for k, v in items)
@@ -514,6 +537,7 @@ def _meta_from_string(meta: str) -> dict:
         'had_header': values.get('header', '1') == '1',
         'had_trailer': values.get('trailer', '1') == '1',
         'tail': b'\x40' * int(values['fill']) if 'fill' in values else bytes.fromhex(values.get('tail', '')),
+        'block_trailer': bytes.fromhex(values.get('block_trailer', BLOCK_TRAILER.hex())),
         'block_trailers': trailers,
     }
 
