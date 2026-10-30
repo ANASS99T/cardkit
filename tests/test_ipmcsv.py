@@ -192,6 +192,7 @@ def test_header_trailer_generated_for_hand_made_csv(tmp_path):
     assert [(r['MTI'], r.get('DE24')) for r in records] == [
         ('1644', '697'), ('1240', '200'), ('1240', '200'), ('1644', '695')]
     assert records[0]['PDS0105'] == '002261030000000123450000' + '7'
+    assert records[0]['PDS0122'] == 'P'
     assert records[0]['DE71'] == 1 and records[-1]['DE71'] == 4
     assert records[-1]['PDS0105'] == records[0]['PDS0105']
     assert records[-1]['PDS0301'] == '0000000000013550'
@@ -258,3 +259,14 @@ def test_blocked_with_zero_block_trailers():
     edited = csv_text_to_ipm_bytes(text.replace('"free text 0000 "', '"' + 'z' * 600 + '"'))
     assert len(edited) % 1014 == 0
     assert {edited[i - 2:i] for i in range(1014, len(edited) + 1, 1014)} == {b'\x00\x00'}
+
+
+def test_header_processing_mode(tmp_path):
+    csv_in, ipm_out = tmp_path / 'in.csv', tmp_path / 'out.ipm'
+    csv_in.write_text(HAND_MADE)
+    assert cardkit_cli.cli_run(['csv2ipm', str(csv_in), '-o', str(ipm_out), '--processing-mode', 'T']) == 0
+    header = next(iter(mciipm.IpmReader(io.BytesIO(ipm_out.read_bytes()))))
+    assert header['PDS0122'] == 'T'
+    ipm = read_csv(io.StringIO(HAND_MADE, newline=''))
+    with pytest.raises(IpmCsvError, match='PDS 0122'):
+        add_header_trailer(ipm, processing_mode='X')

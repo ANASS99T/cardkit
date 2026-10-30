@@ -436,12 +436,12 @@ def _file_control_record(function_code: str, pds_data: str, message_number: int,
                      fields=fields)
 
 
-def add_header_trailer(ipm: IpmFile, file_id: FileId = None,
-                       header: bool = True, trailer: bool = True) -> typing.List[str]:
+def add_header_trailer(ipm: IpmFile, file_id: FileId = None, header: bool = True, trailer: bool = True,
+                       processing_mode: str = 'P') -> typing.List[str]:
     """
     Add file header (1644/697) and trailer (1644/695) records when missing.
 
-    * header DE48: PDS 0105 File ID; DE71 message number 1
+    * header DE48: PDS 0105 File ID, PDS 0122 processing mode; DE71 message number 1
     * trailer DE48: PDS 0105, PDS 0301 file amount checksum (sum of DE4, 16 digits),
       PDS 0306 file message count (all records incl. header and trailer, 8 digits);
       DE71 message number = record count
@@ -450,6 +450,7 @@ def add_header_trailer(ipm: IpmFile, file_id: FileId = None,
 
     :param header: add a header if missing
     :param trailer: add a trailer if missing
+    :param processing_mode: header PDS 0122: ``P`` production or ``T`` test
     :return: list of messages describing what was added
     """
     added = []
@@ -464,8 +465,11 @@ def add_header_trailer(ipm: IpmFile, file_id: FileId = None,
         file_id_value = str(file_id or FileId())
 
     if need_header:
-        ipm.records.insert(0, _file_control_record(HEADER_FUNCTION_CODE, _pds(105, file_id_value), 1, enc))
-        added.append(f'file header (1644/697) with File ID {file_id_value}')
+        if processing_mode not in ('P', 'T'):
+            raise IpmCsvError(f'processing mode (PDS 0122) must be P or T, not {processing_mode!r}')
+        pds_data = _pds(105, file_id_value) + _pds(122, processing_mode)
+        ipm.records.insert(0, _file_control_record(HEADER_FUNCTION_CODE, pds_data, 1, enc))
+        added.append(f'file header (1644/697) with File ID {file_id_value}, processing mode {processing_mode}')
 
     if need_trailer:
         amount = 0
@@ -674,7 +678,7 @@ def convert_ipm_to_csv(in_filename: str, out_filename: str, encoding: str = None
 
 def convert_csv_to_ipm(in_filename: str, out_filename: str, encoding: str = None, blocked: bool = None,
                        bit_config: dict = None, auto_header_trailer: bool = True,
-                       file_id: FileId = None) -> ConversionResult:
+                       file_id: FileId = None, processing_mode: str = 'P') -> ConversionResult:
     """
     Convert a CSV to an IPM file, generating header and trailer records when missing
     (unless the CSV came from an IPM file that had none, or ``auto_header_trailer`` is False).
@@ -683,7 +687,8 @@ def convert_csv_to_ipm(in_filename: str, out_filename: str, encoding: str = None
         ipm = read_csv(in_csv, bit_config, encoding=encoding, blocked=blocked)
     result = ConversionResult(encoding=ipm.encoding, blocked=ipm.blocked)
     if auto_header_trailer:
-        result.messages += add_header_trailer(ipm, file_id, header=ipm.had_header, trailer=ipm.had_trailer)
+        result.messages += add_header_trailer(ipm, file_id, header=ipm.had_header, trailer=ipm.had_trailer,
+                                              processing_mode=processing_mode)
     data = write_ipm(ipm, bit_config)
     with open(out_filename, 'wb') as out_file:
         out_file.write(data)

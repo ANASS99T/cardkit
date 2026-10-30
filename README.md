@@ -50,7 +50,7 @@ You can change values. Lengths for LLVAR/LLLVAR fields are recalculated and the 
 
 When the CSV has no file header (MTI 1644, DE24 `697`) or no trailer (MTI 1644, DE24 `695`), `csv2ipm` generates them:
 
-- **header**: DE48 = PDS 0105 File ID; DE71 = `00000001`
+- **header**: DE48 = PDS 0105 File ID + PDS 0122 processing mode (`--processing-mode`: `P` production, the default, or `T` test); DE71 = `00000001`
 - **trailer**: DE48 = PDS 0105 + PDS 0301 (sum of all DE4 amounts, 16 digits) + PDS 0306 (message count including header and trailer, 8 digits); DE71 = message count
 
 The File ID is copied from the existing header or trailer if there is one. Otherwise it is built from `--file-type`, `--file-date` (YYMMDD, default today), `--processor-id` and `--file-seq`. A CSV made from an IPM file that had no header or trailer remembers that, so `csv2ipm` doesn't add one. `--no-header-trailer` turns generation off.

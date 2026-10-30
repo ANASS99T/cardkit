@@ -50,6 +50,8 @@ def cli_parser():
     to_ipm.add_argument('--file-date', default='', help='generated File ID: date YYMMDD (default today)')
     to_ipm.add_argument('--processor-id', default='00000000000', help='generated File ID: processor id, 11 digits')
     to_ipm.add_argument('--file-seq', default='00001', help='generated File ID: sequence number, 5 digits')
+    to_ipm.add_argument('--processing-mode', default='P', choices=['P', 'T'],
+                        help='generated header PDS 0122: P production (default) or T test')
 
     compare = commands.add_parser('compare', help='byte compare two files')
     compare.add_argument('first')
@@ -73,7 +75,7 @@ def cli_run(argv):
             file_id = FileId(args.file_type, args.file_date, args.processor_id, args.file_seq)
             result = convert_csv_to_ipm(args.in_filename, out, encoding=args.encoding, blocked=args.blocked,
                                         bit_config=bit_config, auto_header_trailer=args.auto_header_trailer,
-                                        file_id=file_id)
+                                        file_id=file_id, processing_mode=args.processing_mode)
     except (IpmCsvError, OSError) as ex:
         print(f'cardkit: error: {ex}', file=sys.stderr)
         return 1
